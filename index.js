@@ -132,9 +132,14 @@ async function waitForChapterStability(page) {
 
   while (Date.now() - start < MAX_WAIT_MS) {
     const items = await page.evaluate(() => {
+      // v0.7.1 P2: 黑名单 — 过滤播放器控件文本
+      // 注意：章节行通常是 "HH:MM | 章节标题"，但播放器控件会拼接成 "00:0X / 视频总时长 | 倍速/连播/..."
+      // 所以用"包含"而不是"^...$"精确匹配
+      const PLAYER_CONTROL_KEYWORDS = /因浏览器限制|当前为静音|倍速|连播|^播放$|^暂停$|清屏|智能(?!段)|画质|弹幕/;
       const found = Array.from(document.querySelectorAll('li, div, span, p'))
         .map(e => (e.innerText || '').trim())
         .filter(t => /^\d{2}:\d{2}\s+\S/.test(t))
+        .filter(t => !PLAYER_CONTROL_KEYWORDS.test(t))
         .map(t => t.split('\n').slice(0, 2).join(' | '));
       // dedup
       return found.filter((v, i, a) => a.indexOf(v) === i).slice(0, 25);
@@ -175,7 +180,7 @@ async function scrapeDouyinPage(page, url) {
   // --- 主视频元数据（data-e2e="detail-video-info" 是真视频容器）---
   const meta = await page.evaluate(() => {
     const out = { title: null, publishTime: null, stats: {}, author: null, videoId: null, url: location.href };
-    out.videoId = location.pathname.match(/\/video\/(\d+)/)?.[1] || null;
+    out.videoId = location.pathname.match(/\/(?:video|shipin)\/(\d+)/)?.[1] || null;
 
     const info = document.querySelector('[data-e2e="detail-video-info"]');
     if (info) {
@@ -193,6 +198,24 @@ async function scrapeDouyinPage(page, url) {
       // 数字（11.0万 / 8815 / 3.6万 / 3.1万）
       const nums = info.innerText.match(/\d+(?:\.\d+)?[万亿]?/g) || [];
       // 顺序：点赞 评论 收藏 分享（不一定都对，按位置猜）
+      out.stats = { raw: nums.slice(0, 6) };
+    } else {
+      // v0.7.1 P1: 降级 DOM 提取（detail-video-info 不存在时）
+      // 长视频/特殊布局页可能没有这个容器，改用 <h1> + meta 标签
+      const h1 = document.querySelector('h1');
+      if (h1) out.title = h1.innerText.trim();
+      // og:title 兜底
+      if (!out.title) {
+        const og = document.querySelector('meta[property="og:title"]');
+        if (og) out.title = og.getAttribute('content')?.trim() || null;
+      }
+      // 发布时间：从 meta description / 全文正则
+      const metaDesc = document.querySelector('meta[name="description"]')?.getAttribute('content') || '';
+      const m = metaDesc.match(/(\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2})/)
+        || document.body.innerText.match(/(\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2})/);
+      if (m) out.publishTime = m[1];
+      // 互动数据：直接从 body 文本抽
+      const nums = (document.body.innerText.match(/\d+(?:\.\d+)?[万亿]?/g) || []);
       out.stats = { raw: nums.slice(0, 6) };
     }
 
@@ -598,9 +621,12 @@ function buildJson(data) {
       // raw_payload 不含 cookie（本来就没读）也不含 mp4 URL
     },
     failure_log: [...FAILURE_LOG],  // 拷贝一份，避免后续操作影响原数组
-    // v0.6: AI 总结（仅 enabled 且 LLM 成功时存在；LLM 失败时为 null）
-    summary: data.summary || null,
+    // v0.7.1 P3: summary 字段在 enabled=false 或 LLM 失败时为 null，整字段不写
+    // （v0.6 行为：始终写 null；v0.7.1 行为：仅在有值时写）
   };
+  if (data.summary) {
+    obj.summary = data.summary;
+  }
 
   return JSON.stringify(obj, null, 2) + '\n';
 }
