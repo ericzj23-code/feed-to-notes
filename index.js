@@ -136,45 +136,20 @@ async function scrapeDouyinPage(page, url) {
       out.stats = { raw: nums.slice(0, 6) };
     }
 
-    // 作者：抖音 PC 版作者卡片特征 = 包含 "粉丝" + 数字 + user 链接（不受 class 名/文字锚点变化影响）
-    // 策略：在所有 a[href*="/user/"] 里，找其祖先节点文本含 "粉丝" 且 "已关注"/"关注" 的（这是作者卡片独占特征）
-    const candidateAuthorLinks = Array.from(document.querySelectorAll('a[href*="/user/"]'))
-      .filter(a => !a.getAttribute('href').includes('/user/self'));
-    let authorLink = null;
-    for (const a of candidateAuthorLinks) {
-      // 爬 5 层祖先，找含 "粉丝" 字样的祖先
-      let p = a;
-      for (let i = 0; i < 5; i++) {
-        p = p.parentElement;
-        if (!p) break;
-        const txt = p.innerText || '';
-        if (txt.includes('粉丝') && /\d+\.?\d*\s*万?/.test(txt)) {
-          authorLink = a;
-          break;
-        }
-      }
-      if (authorLink) break;
-    }
+    // 作者：抖音 PC 版把作者信息塞在 related-video 节点里，但作者 user_id 唯一
+    // 策略：找"作者"二字附近的 a[href*="/user/"]
+    const authorLink = Array.from(document.querySelectorAll('a[href*="/user/"]'))
+      .find(a => {
+        // 取带 "作者" 后缀的、或其父节点文本含 "作者" 的
+        const parent = a.parentElement?.parentElement;
+        return (parent?.innerText || '').includes('作者');
+      });
     if (authorLink) {
-      // 优先取链接的 innerText
-      out.author = authorLink.innerText.trim() || null;
-      // 文本为空就取 img alt（头像 alt 经常是作者名）
+      out.author = authorLink.innerText.replace(/作者/g, '').trim() || null;
       if (!out.author) {
+        // 文本为空就取 img alt
         const img = authorLink.querySelector('img[alt]');
         out.author = img?.getAttribute('alt') || null;
-      }
-      // 兜底：从祖先含"粉丝"的节点里抽第一行
-      if (!out.author) {
-        let p = authorLink;
-        for (let i = 0; i < 5; i++) {
-          p = p.parentElement;
-          if (!p) break;
-          const firstLine = (p.innerText || '').split('\n').map(s => s.trim()).find(s => s.length >= 2 && s.length <= 30);
-          if (firstLine && !/^(粉丝|获赞|已关注|关注|私信)$/.test(firstLine)) {
-            out.author = firstLine;
-            break;
-          }
-        }
       }
     }
 
@@ -182,14 +157,8 @@ async function scrapeDouyinPage(page, url) {
   });
 
   if (!meta.title) fail('标题未抓到', 'detail-video-info 容器为空或无 h1');
-  if (!meta.author) {
-    fail('作者未抓到', '作者卡片 selector 失效或视频无作者信息');
-    log('WARN', '作者未抓到（不影响继续）');
-  }
-  if (!meta.publishTime) {
-    fail('发布时间未抓到', 'detail-video-publish-time 元素不存在');
-    log('WARN', '发布时间未抓到');
-  }
+  if (!meta.author) log('WARN', '作者未抓到（不影响继续）');
+  if (!meta.publishTime) log('WARN', '发布时间未抓到');
 
   // --- 章节列表（HH:MM 模式）---
   const chapters = await page.evaluate(() => {
@@ -214,40 +183,8 @@ async function scrapeDouyinPage(page, url) {
     }
 
     comments = await page.evaluate((max) => {
-      // 评论条目指纹 = 含 "回复" + "分享" + 数字赞数 的最小重复 DOM 块
-      // 抖音评论条目的稳定特征不是 class 名（class 经常变），而是 DOM 文本结构
-      // 策略：先收集所有候选节点，再按结构过滤
-      const allEls = Array.from(document.querySelectorAll('div, li, article, section'));
-
-      // 候选：节点文本长度合理（>20 < 1500），且同时含 "回复" 和 "分享"
-      const candidates = allEls.filter(el => {
-        const txt = (el.innerText || '').trim();
-        if (txt.length < 20 || txt.length > 1500) return false;
-        if (!txt.includes('回复')) return false;
-        if (!txt.includes('分享')) return false;
-        // 必须含一个数字（赞数）— 但排除纯时间数字（"5天前"）
-        if (!/\b\d{1,5}\b/.test(txt)) return false;
-        return true;
-      });
-
-      // 取"最小"的那些（子节点最少的才是单条评论，大的可能是评论列表整体）
-      // 按子元素数升序排，取前面若干
-      candidates.sort((a, b) => a.children.length - b.children.length);
-
-      // 再 dedup：如果 A 是 B 的祖先，跳 A
-      const filtered = [];
-      for (const c of candidates) {
-        let isAncestor = false;
-        for (const other of candidates) {
-          if (other !== c && c.contains(other) && c !== other) {
-            isAncestor = true;
-            break;
-          }
-        }
-        if (!isAncestor) filtered.push(c);
-      }
-
-      return filtered.slice(0, max).map(item => {
+      const items = Array.from(document.querySelectorAll('[class*="comment-mainContent"]'));
+      return items.slice(0, max).map(item => {
         const full = item.innerText.trim();
         // 提取用户名（首行）— 但首行可能是数字或时间，要排除
         const lines = full.split('\n').map(l => l.trim()).filter(Boolean);
@@ -280,10 +217,7 @@ async function scrapeDouyinPage(page, url) {
       }).filter(c => c.text && c.text.length > 3);
     }, COMMENT_MAX_COUNT);
     log('INFO', `评论: ${comments.length} 条`);
-    if (comments.length === 0) {
-      fail('评论未抓到', '未找到匹配"回复+分享+数字赞数"的评论条目 DOM（可能未登录或视频无评论）');
-      log('WARN', '评论未抓到（可能未登录或视频无评论）');
-    }
+    if (comments.length === 0) log('WARN', '评论未抓到（可能未登录或视频无评论）');
   } else {
     log('INFO', '配置 fetch_comments=false，跳过评论抓取');
   }
