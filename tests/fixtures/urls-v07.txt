@@ -1,0 +1,46 @@
+# v0.7 quality baseline - 30条真实抖音URL（去重后27条有效）
+# 涵盖：短链/长链 / /shipin/ / /video/ / 不同博主 / 重复 / 无效 / 注释
+# 用法：node index.js --file urls.txt
+
+# --- 短链（1条，已抓过测跳过） ---
+https://v.douyin.com/2vX7spOC_sg/
+
+# --- /shipin/ 长链（20条）---
+# 韬定律专题（不同博主）
+https://www.douyin.com/shipin/7644762283377248283
+https://www.douyin.com/shipin/7644725276597045288
+https://www.douyin.com/shipin/7644721442206042118
+https://www.douyin.com/shipin/7644761075384059944
+https://www.douyin.com/shipin/7644735085421578286
+https://www.douyin.com/shipin/7644740744518977563
+https://www.douyin.com/shipin/7644742986114304052
+https://www.douyin.com/shipin/7645520063658936363
+https://www.douyin.com/shipin/7644722471517816883
+# 玻璃基板专题
+https://www.douyin.com/shipin/7628407482322470950
+https://www.douyin.com/shipin/7644022379093887016
+https://www.douyin.com/shipin/7645111420308310062
+https://www.douyin.com/shipin/7643994891457955849
+https://www.douyin.com/shipin/7642886525554051108
+# 长电/通富封测专题
+https://www.douyin.com/shipin/7643616775296288778
+https://www.douyin.com/shipin/7644727656323483698
+https://www.douyin.com/shipin/7642895303372326966
+https://www.douyin.com/shipin/7642546275069544502
+# 已被抓过的（测跳过）
+https://www.douyin.com/shipin/7644729891430336512
+https://www.douyin.com/shipin/7644750321394550824
+
+# --- /video/ 长链（6条）---
+https://www.douyin.com/video/7617785438106864942
+https://www.douyin.com/video/7618504725608140047
+https://www.douyin.com/video/7618579923188899186
+https://www.douyin.com/video/7585386509264571667
+https://www.douyin.com/video/7616285289895578932
+https://www.douyin.com/video/7593947355049934521
+
+# --- 1 条无效 URL（应被过滤） ---
+https://www.youtube.com/watch?v=test
+
+# 注释行（应被忽略）
+# https://www.douyin.com/shipin/7644000000000000000
