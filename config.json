@@ -19,5 +19,12 @@
     "base_url": "https://api.minimaxi.com/anthropic",
     "max_tokens": 1024,
     "timeout_ms": 30000
+  },
+  "creator_tracking": {
+    "tracker_dir": "/mnt/d/ObsidianVault/DouyinTracker",
+    "max_videos_per_creator": 200,
+    "scroll_stable_rounds": 2,
+    "scroll_max_no_change": 5,
+    "scroll_pause_ms": 1500
   }
 }

@@ -43,6 +43,20 @@ const SUMMARY_MAX_TOKENS = CONFIG.summary?.max_tokens || 1024;
 const SUMMARY_TIMEOUT_MS = CONFIG.summary?.timeout_ms || 30000;
 
 // ============================================================
+// v0.9 creator tracking 配置（缺省即用默认；不破坏 v0.7.1 兼容）
+// ============================================================
+const CT = CONFIG.creator_tracking || {};
+const TRACKER_DIR = CT.tracker_dir || '/mnt/d/ObsidianVault/DouyinTracker';
+const CT_STATE_DIR = path.join(TRACKER_DIR, 'state');
+const CT_REPORT_DIR = path.join(TRACKER_DIR, 'reports');
+const CT_QUEUE_DIR = path.join(TRACKER_DIR, 'queue');
+const CT_LOG_DIR = path.join(TRACKER_DIR, 'logs');
+const CT_MAX_VIDEOS = CT.max_videos_per_creator || 200;
+const CT_SCROLL_STABLE_ROUNDS = CT.scroll_stable_rounds || 2;
+const CT_SCROLL_MAX_NO_CHANGE = CT.scroll_max_no_change || 5;
+const CT_SCROLL_PAUSE_MS = CT.scroll_pause_ms || 1500;
+
+// ============================================================
 // 日志工具
 // ============================================================
 const LOG_PREFIX = {
@@ -1059,11 +1073,393 @@ async function runBatch(urlsFile) {
   return summary;
 }
 
+// ============================================================
+// v0.9 creator tracking（博主主页追踪）
+// 范围：抓作品 tab 的视频列表 + 维护 state + 生成报告
+// 不抓 mp4 / 不调 LLM / 不抓单视频
+// ============================================================
+
+// 从博主 URL 提取 sec_uid（user/<sec_uid> 形式）
+function extractSecUid(url) {
+  // 处理跳转后 URL / 短链跳转后 / 显式 sec_uid
+  // 形态：https://www.douyin.com/user/MS4wLjABAAAA... 或带 ?tab=post 等 query
+  const m = String(url || '').match(/\/user\/([A-Za-z0-9_\-]+)/);
+  return m ? m[1] : null;
+}
+
+// 校验博主 URL 形态：必须是 douyin.com/user/<sec_uid>
+function isValidCreatorUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  if (!url.includes('douyin.com')) return false;
+  return extractSecUid(url) !== null;
+}
+
+// 抓博主主页"作品"tab：返回 {sec_uid, nickname, follower, follow, liked, signature, videos:[{aweme_id, title, href}]}
+async function scrapeCreatorPage(page, secUid) {
+  const targetUrl = `https://www.douyin.com/user/${secUid}?tab=post`;
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: GOTO_TIMEOUT_MS });
+  await page.waitForTimeout(WAIT_AFTER_NAV_MS);
+
+  // 滚动抓作品列表
+  const seen = new Map(); // aweme_id -> {aweme_id, title, href}
+  let stableRounds = 0;
+  let noChangeRounds = 0;
+  let lastTotal = 0;
+
+  for (let i = 0; i < 200; i++) { // 200 次滚动是硬上限（即便配置再大也兜底）
+    const round = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a[href*="/video/"]'));
+      const cards = [];
+      for (const a of anchors) {
+        const href = a.getAttribute('href') || '';
+        const m = href.match(/\/video\/(\d+)/);
+        if (!m) continue;
+        const id = m[1];
+        // 标题：往上找祖先拿全文，截 [a 之后的 p]
+        let title = null;
+        let node = a;
+        for (let k = 0; k < 6; k++) {
+          if (!node.parentElement) break;
+          node = node.parentElement;
+        }
+        // 在卡片容器里找一个最像标题的 p
+        const ps = node.querySelectorAll('p');
+        for (const p of ps) {
+          const t = (p.innerText || '').trim();
+          if (t && t.length >= 2 && t.length < 200) {
+            title = t;
+            break;
+          }
+        }
+        cards.push({ id, href: href.startsWith('http') ? href : `https://www.douyin.com${href.startsWith('/') ? '' : '/'}${href}`, title });
+      }
+      return cards;
+    });
+
+    for (const c of round) {
+      if (!seen.has(c.id)) {
+        seen.set(c.id, { aweme_id: c.id, title: c.title, href: c.href });
+      }
+    }
+
+    const curTotal = seen.size;
+    if (curTotal >= CT_MAX_VIDEOS) {
+      log('INFO', `达到 max_videos_per_creator=${CT_MAX_VIDEOS}，停止滚动`);
+      break;
+    }
+    if (curTotal === lastTotal) {
+      noChangeRounds++;
+      stableRounds++;
+      if (stableRounds >= CT_SCROLL_STABLE_ROUNDS || noChangeRounds >= CT_SCROLL_MAX_NO_CHANGE) {
+        log('INFO', `连续无新视频（stable=${stableRounds}, noChange=${noChangeRounds}），停止滚动`);
+        break;
+      }
+    } else {
+      stableRounds = 0;
+      noChangeRounds = 0;
+    }
+    lastTotal = curTotal;
+
+    // 触发懒加载
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.2));
+    await page.waitForTimeout(CT_SCROLL_PAUSE_MS);
+  }
+
+  // 抓博主元信息
+  const meta = await page.evaluate(() => {
+    const body = document.body.innerText || '';
+    const follower = (body.match(/粉丝\s*([\d.]+\s*[万亿]?)/) || [])[1] || null;
+    const follow   = (body.match(/关注\s*(\d+(?:\.\d+)?\s*[万亿]?)/) || [])[1] || null;
+    const liked    = (body.match(/获赞\s*([\d.]+\s*[万亿]?)/) || [])[1] || null;
+    // 昵称：拿 user-title 块的首行（去掉"关注/粉丝/获赞"等元数据行）
+    const titleEl = document.querySelector('[class*="user-title"]');
+    let nickname = null;
+    if (titleEl) {
+      const t = (titleEl.innerText || '').trim();
+      // 首行通常是昵称
+      nickname = t.split('\n')[0].trim() || null;
+    }
+    if (!nickname) {
+      // 兜底：找 h1 / og:title
+      const h1 = document.querySelector('h1');
+      if (h1) nickname = (h1.innerText || '').trim().split('\n')[0].trim() || null;
+    }
+    if (!nickname) {
+      const og = document.querySelector('meta[property="og:title"]');
+      if (og) nickname = (og.getAttribute('content') || '').trim() || null;
+    }
+    // 签名：找"个人简介"附近的 p
+    let signature = null;
+    const allP = Array.from(document.querySelectorAll('p'));
+    for (const p of allP) {
+      const t = (p.innerText || '').trim();
+      if (t && t.length > 5 && t.length < 200 && !/^\d+/.test(t) && !/[☐☜]/.test(t)) {
+        // 排除明显元数据
+        if (!/粉丝|关注|获赞|抖音号|IP属地|岁$/.test(t)) {
+          signature = t;
+          break;
+        }
+      }
+    }
+    return { nickname, follower, follow, liked, signature };
+  });
+
+  return {
+    sec_uid: secUid,
+    nickname: meta.nickname,
+    follower: meta.follower,
+    follow: meta.follow,
+    liked: meta.liked,
+    signature: meta.signature,
+    videos: Array.from(seen.values()),
+  };
+}
+
+// 加载 state；不存在返回 null
+function loadCreatorState(secUid) {
+  const fp = path.join(CT_STATE_DIR, `${secUid}.json`);
+  if (!fs.existsSync(fp)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(fp, 'utf8'));
+  } catch (e) {
+    log('WARN', `state 解析失败（${fp}）: ${e.message}，视为无 state`);
+    return null;
+  }
+}
+
+// 写 state
+function saveCreatorState(secUid, data) {
+  if (!fs.existsSync(CT_STATE_DIR)) fs.mkdirSync(CT_STATE_DIR, { recursive: true });
+  const fp = path.join(CT_STATE_DIR, `${secUid}.json`);
+  const now = new Date().toISOString();
+  const prev = loadCreatorState(secUid);
+  const knownSet = new Set(prev?.known_aweme_ids || []);
+  for (const v of data.videos) knownSet.add(v.aweme_id);
+  const state = {
+    sec_uid: secUid,
+    nickname: data.nickname,
+    first_seen: prev?.first_seen || now,
+    last_checked: now,
+    known_aweme_ids: Array.from(knownSet),
+    last_run_summary: {
+      total_found: data.videos.length,
+      new_count: data.newCount,
+      new_aweme_ids: data.newAwemeIds,
+    },
+  };
+  fs.writeFileSync(fp, JSON.stringify(state, null, 2), 'utf8');
+  return { fp, state };
+}
+
+// 生成 report md
+function buildCreatorReport(secUid, data, statePath) {
+  const now = new Date().toISOString();
+  const isBaseline = data.isBaseline;
+  // 数据清洗：去掉换行/多余空白（防止 markdown 表格断裂）
+  const clean = (v) => v == null ? '(未获取)' : String(v).replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim() || '(未获取)';
+  const head = [
+    isBaseline ? '# [BASELINE] 博主主页首次建档报告' : '# 博主主页追踪报告',
+    '',
+    '| 字段 | 值 |',
+    '|------|-----|',
+    `| sec_uid | \`${secUid}\` |`,
+    `| 昵称 | ${clean(data.nickname)} |`,
+    `| 粉丝 | ${clean(data.follower)} |`,
+    `| 关注 | ${clean(data.follow)} |`,
+    `| 获赞 | ${clean(data.liked)} |`,
+    `| 签名 | ${clean(data.signature)} |`,
+    `| 本次抓到 | ${data.videos.length} 个视频 |`,
+    `| 新增 | ${data.newCount} 个 |`,
+    `| 运行时间 | ${now} |`,
+    `| 模式 | ${isBaseline ? 'BASELINE（建档）' : 'DELTA（追踪）'} |`,
+    `| state 文件 | \`${statePath}\` |`,
+    '',
+  ];
+
+  let body = '';
+  if (isBaseline) {
+    body = '## 全部视频（首次建档，请人工核对）\n\n';
+    body += '| # | aweme_id | 标题 | 链接 |\n';
+    body += '|---|----------|------|------|\n';
+    data.videos.forEach((v, i) => {
+      const t = (v.title || '(无标题)').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+      body += `| ${i + 1} | \`${v.aweme_id}\` | ${t} | [打开](${v.href}) |\n`;
+    });
+  } else {
+    body = '## 新增视频\n\n';
+    if (data.newCount === 0) {
+      body += '本次没有新增视频。\n';
+    } else {
+      body += '| # | aweme_id | 标题 | 链接 |\n';
+      body += '|---|----------|------|------|\n';
+      const newSet = new Set(data.newAwemeIds);
+      data.videos.filter(v => newSet.has(v.aweme_id)).forEach((v, i) => {
+        const t = (v.title || '(无标题)').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+        body += `| ${i + 1} | \`${v.aweme_id}\` | ${t} | [打开](${v.href}) |\n`;
+      });
+    }
+    body += '\n## 本次抓到全部（仅作参考）\n\n';
+    body += `本次共抓 ${data.videos.length} 个视频，其中 ${data.newCount} 个为新增（其余已在 state 中）。\n`;
+  }
+
+  return head.join('\n') + '\n' + body;
+}
+
+// 跑单博主：抓 + diff + 写 state + 写 report
+async function runCreator(url, options = {}) {
+  const { isBatch = false } = options;
+  const startedAt = Date.now();
+  const secUid = extractSecUid(url);
+  if (!secUid) {
+    return { url, status: 'failed', reason: '无法提取 sec_uid（URL 必须含 /user/<sec_uid>）', file: null, elapsed_ms: 0 };
+  }
+
+  const result = { url, sec_uid: secUid, status: 'failed', file: null, reason: null, elapsed_ms: 0 };
+
+  log('INFO', `开始追踪博主: sec_uid=${secUid}`);
+  let browser;
+  let sharedContext;
+  try {
+    browser = await connectBrowser();
+    sharedContext = browser.contexts()[0] || await browser.newContext();
+  } catch (e) {
+    result.reason = `CDP 连接失败: ${e.message}`;
+    result.elapsed_ms = Date.now() - startedAt;
+    return result;
+  }
+
+  let page;
+  try {
+    page = await sharedContext.newPage();
+    const data = await scrapeCreatorPage(page, secUid);
+    await page.close();
+
+    // diff
+    const prev = loadCreatorState(secUid);
+    const isBaseline = !prev;
+    const knownSet = new Set(prev?.known_aweme_ids || []);
+    const newIds = data.videos.filter(v => !knownSet.has(v.aweme_id)).map(v => v.aweme_id);
+
+    const enriched = { ...data, isBaseline, newCount: isBaseline ? data.videos.length : newIds.length, newAwemeIds: newIds };
+
+    // 写 state
+    const { fp: stateFp } = saveCreatorState(secUid, enriched);
+
+    // 写 report
+    if (!fs.existsSync(CT_REPORT_DIR)) fs.mkdirSync(CT_REPORT_DIR, { recursive: true });
+    const reportName = `${secUid}-${new Date().toISOString().slice(0, 10)}${isBaseline ? '-BASELINE' : ''}.md`;
+    const reportFp = path.join(CT_REPORT_DIR, reportName);
+    const reportContent = buildCreatorReport(secUid, enriched, stateFp);
+    fs.writeFileSync(reportFp, reportContent, 'utf8');
+
+    log('SUCCESS', `[${isBaseline ? 'BASELINE' : 'DELTA'}] sec_uid=${secUid} 抓 ${data.videos.length} 条, 新增 ${enriched.newCount} 条`);
+    log('SUCCESS', `state: ${stateFp}`);
+    log('SUCCESS', `report: ${reportFp}`);
+
+    if (!isBatch) {
+      console.log('\n----- 博主追踪摘要 -----');
+      console.log(`昵称: ${data.nickname || '(未获取)'}`);
+      console.log(`粉丝: ${data.follower || '(未获取)'} | 关注: ${data.follow || '(未获取)'} | 获赞: ${data.liked || '(未获取)'}`);
+      console.log(`本次抓到: ${data.videos.length} 个视频`);
+      console.log(`新增: ${enriched.newCount} 个`);
+      console.log(`模式: ${isBaseline ? 'BASELINE' : 'DELTA'}`);
+      console.log('------------------------\n');
+    }
+
+    result.status = 'success';
+    result.file = reportFp;
+    result.state_file = stateFp;
+    result.new_count = enriched.newCount;
+    result.total_found = data.videos.length;
+  } catch (e) {
+    result.reason = e.message;
+    if (page) try { await page.close(); } catch {}
+    fail('博主追踪异常', e.message);
+  }
+  result.elapsed_ms = Date.now() - startedAt;
+  return result;
+}
+
+// 批量博主：复用 runCreator
+async function runCreatorsBatch(filepath) {
+  if (!fs.existsSync(filepath)) {
+    console.error(`[ERROR] 博主文件不存在: ${filepath}`);
+    return null;
+  }
+  const text = fs.readFileSync(filepath, 'utf8');
+  const urls = text.split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('#'));
+  if (urls.length === 0) {
+    console.error('[ERROR] 博主文件为空');
+    return null;
+  }
+  log('INFO', `批量博主模式: ${urls.length} 个博主`);
+  const items = [];
+  for (const url of urls) {
+    if (!isValidCreatorUrl(url)) {
+      log('WARN', `跳过无效博主 URL: ${url}`);
+      items.push({ url, status: 'failed', reason: '不是有效博主 URL（必须含 douyin.com/user/<sec_uid>）' });
+      continue;
+    }
+    const r = await runCreator(url, { isBatch: true });
+    items.push(r);
+    log('INFO', `--- ${r.status} | ${r.url} ---`);
+  }
+  const summary = {
+    total: urls.length,
+    success: items.filter(i => i.status === 'success').length,
+    failed: items.filter(i => i.status === 'failed').length,
+  };
+  log('INFO', `批量博主汇总: total=${summary.total} success=${summary.success} failed=${summary.failed}`);
+  return { ...summary, items };
+}
+
 async function main() {
   const args = process.argv.slice(2);
 
-  // 批量模式：node index.js --file urls.txt
-  if (args[0] === '--file' || args[0] === '-f') {
+  // 互斥检查：--file 和 --creators-file 不能同时给
+  const hasFile = args.includes('--file') || args.includes('-f');
+  const hasCreatorsFile = args.includes('--creators-file');
+  if (hasFile && hasCreatorsFile) {
+    console.error('[ERROR] --file 和 --creators-file 不能同时使用');
+    process.exit(1);
+  }
+
+  // 单博主模式：node index.js --creator "<url>"
+  if (args[0] === '--creator') {
+    const url = args[1];
+    if (!url) {
+      console.error('用法: node index.js --creator "<creator_url>"');
+      console.error('示例: node index.js --creator "https://www.douyin.com/user/MS4wLjABAAAA..."');
+      process.exit(1);
+    }
+    if (!isValidCreatorUrl(url)) {
+      console.error('[ERROR] 不是有效的博主 URL（必须含 douyin.com/user/<sec_uid>）');
+      process.exit(1);
+    }
+    const result = await runCreator(url, { isBatch: false });
+    if (result.status === 'failed') {
+      console.error(`[ERROR] 博主追踪失败: ${result.reason}`);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
+
+  // 批量博主模式：node index.js --creators-file file.txt
+  if (hasCreatorsFile) {
+    const filepath = args[1];
+    if (!filepath) {
+      console.error('用法: node index.js --creators-file <creators.txt>');
+      process.exit(1);
+    }
+    const summary = await runCreatorsBatch(filepath);
+    if (!summary) process.exit(1);
+    process.exit(summary.failed > 0 ? 1 : 0);
+  }
+
+  // 批量视频模式：node index.js --file urls.txt
+  if (hasFile) {
     const urlsFile = args[1];
     if (!urlsFile) {
       console.error('用法: node index.js --file <urls.txt>');
@@ -1079,8 +1475,10 @@ async function main() {
   const url = args[0];
   if (!url) {
     console.error('用法:');
-    console.error('  单条: node index.js "<douyin_url>"');
-    console.error('  批量: node index.js --file <urls.txt>');
+    console.error('  单视频:     node index.js "<douyin_url>"');
+    console.error('  批量视频:   node index.js --file <urls.txt>');
+    console.error('  单博主:     node index.js --creator "<creator_url>"');
+    console.error('  批量博主:   node index.js --creators-file <creators.txt>');
     console.error('示例: node index.js "https://v.douyin.com/2vX7spOC_sg/"');
     process.exit(1);
   }
