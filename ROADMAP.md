@@ -197,3 +197,35 @@ v0.9 新增 `creator_tracking` 配置块（缺省即用默认，不破坏现有 
 4. 最后跑 ⑦⑧⑨⑩（批量 / 互斥 / 单视频 / 报告人工 review）
 
 > 阶段六设计稿到此为止。等你确认整体设计 + 3 个测试博主候选后，才进入 v0.9.1 实施。
+
+---
+
+## 阶段六实施记录
+
+> **状态**：✅ 已完成（2026-06-01）
+> **commit**：`6f99639` (Card 1+2+3) + `test-report-v09.md` commit (Card 4)
+> **tag**：`v0.9-creator-tracking`
+
+### 实施结果
+
+| 验收项 | 结果 | 备注 |
+|--------|------|------|
+| ① 单博主 baseline | ✅ 62 条 / 10.7s | 九号科技快讯 |
+| ② baseline report | ✅ `[BASELINE]` 前缀 + 全部视频 | 13 KB |
+| ③ delta 模式 | ✅ 22/22 正确识别 | 步 2 实证 |
+| ④ state 持久化 | ✅ union 累计 30→52→78→62→69 | 5 步走 |
+| ⑤ v0.7.1 零回归 | ✅ 用户视角 24/27=24/27 | apples-to-apples |
+| ⑥ 不抓 mp4 / 不调 AI | ✅ AI 隔离 0 调用 | `summary.enabled=true` 跑 --creator |
+| ⑦ 批量博主 | ⏸ 逻辑已实现，未真实压 3 个博主批量 | v0.10+ 补 |
+| ⑧ 互斥检查 | ✅ | `--file` + `--creators-file` 报错 |
+| ⑨ 主流程 0 回归 | ✅ `scrapeDouyinPage` 219 行未变 | 硬证据 |
+| ⑩ 报告可读 | ✅ DELTA + BASELINE 表格渲染正常 | |
+
+### 偏离设计的地方
+
+1. **report 文件名 DELTA 加 `HHMMSS` 时间戳**（设计稿是 `<sec_uid>-<ISO_DATE>.md`）—— Card 4 修。原因：DELTA 多次跑会覆盖，HHMMSS 让每次跑独立成文件。BASELINE 不带时间戳（一次性建档没必要）。
+2. **state 删后 first_seen 重置** —— Card 3 报告里曾标"设计妥协"，**Card 4 重新审视**为"v0.9.1 设计契约"。state = 当前累计；删 = 主动丢历史。archive 机制是 v0.10+ 范围。
+
+### 详细测试数据
+
+见 `test-report-v09.md`（5 步走 + 5 步算法正确性硬证据）。

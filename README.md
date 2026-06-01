@@ -1,6 +1,6 @@
 # douyin-link-to-obsidian
 
-> **当前能力边界**（v0.6 标签对应 `v0.6-summary-layer`）
+> **当前能力边界**（v0.9 标签对应 `v0.9-creator-tracking`）
 >
 > | 项 | 状态 |
 > |---|---|
@@ -21,8 +21,8 @@
 > | 已抓过链接自动跳过 | ✅ 已支持（v0.5 新增，扫描 OUTPUT_DIR 里的 `.json` 文件判定） |
 > | batch-log.json 输出 | ✅ 已支持（v0.5 新增，追加式记录每次批次的 items + 统计） |
 > | **AI 总结层（可选）** | ✅ 已支持（v0.6 新增，`summary.enabled` 开关，LLM 失败不影响主流程） |
+> | **博主主页追踪** | ✅ 已支持（v0.9 新增，`--creator` / `--creators-file`，state 持久化 + delta/baseline 报告） |
 > | 字幕 | ❌ 暂不支持 |
-> | 博主主页跟踪 | ❌ 暂不支持（ROADMAP 阶段四明确不做） |
 > | LLM 总结（默认开启） | ❌ 默认关闭，需 `summary.enabled=true` |
 > | 字幕自动展开 | ❌ 暂不支持（需手动点播放器字幕按钮） |
 
@@ -340,6 +340,91 @@ v0.6 写入策略：
   2. 等 v0.7 增加 undici ProxyAgent 支持（v0.6 范围外）
 - API key 必须**有 Anthropic-compatible 端点权限**（MiniMax CN 默认走 `/anthropic/v1/messages`）
 
+## 博主主页追踪（v0.9）
+
+> **目标**：固定抖音博主主页追踪，**只发现新增视频**，**不抓 mp4**、**不下载**、**不做字幕**、**不做 AI summary**。
+
+### 用法
+
+```bash
+# 单博主
+node index.js --creator "https://www.douyin.com/user/<sec_uid>"
+
+# 批量博主（creators.txt 每行一个 URL，# 开头是注释）
+node index.js --creators-file creators.txt
+```
+
+> 互斥：`--file`（视频批量） 与 `--creators-file`（博主批量）不能同时给，**混用直接报错退出**。
+
+### 工作流
+
+| 阶段 | 触发 | 模式 | 报告标题 |
+|------|------|------|----------|
+| 首次跑 | state 文件不存在 | **BASELINE** | `[BASELINE] 博主主页首次建档报告` |
+| 后续跑 | state 文件存在 | **DELTA** | `博主主页追踪报告` |
+
+- BASELINE 模式：**视当前主页所有视频为"已知"**，不触发"新增视频"报告；但生成 baseline report 列出全部视频
+- DELTA 模式：报告里**只列新增** + 顶部元信息（粉丝/获赞/时间等）
+
+### 目录结构
+
+所有追踪产物落到 `D:\ObsidianVault\DouyinTracker\` 下，**不污染**现有 `D:\ObsidianVault\Douyin\` 笔记目录：
+
+```
+D:\ObsidianVault\DouyinTracker\
+├── state\      # 博主状态：state/<sec_uid>.json（已知 aweme_id 累计）
+├── reports\    # 报告：reports/<sec_uid>-<ISO_DATE>-<HHMMSS>[-BASELINE].md
+├── queue\      # 预留：v0.10+ 自动 follow-up 抓取的视频 ID 队列
+└── logs\       # 预留：博主追踪运行日志
+```
+
+### State 文件 schema
+
+`state/<sec_uid>.json`：
+```json
+{
+  "sec_uid": "MS4wLjABAAAA...",
+  "nickname": "九号科技快讯",
+  "first_seen": "2026-06-01T13:32:23.804Z",
+  "last_checked": "2026-06-01T14:22:14.221Z",
+  "known_aweme_ids": ["7646400922290338673", "..."],
+  "last_run_summary": {
+    "total_found": 62,
+    "new_count": 22,
+    "new_aweme_ids": ["7632633108655058917", "..."]
+  }
+}
+```
+
+- `known_aweme_ids` **跨多次跑 union 累计**
+- `first_seen` **首次跑写入；删 state 即丢失**（v0.9.1 设计契约，v0.10+ 考虑加 archive 机制）
+
+### Report 触发条件
+
+| 场景 | 报告输出 |
+|------|----------|
+| state 不存在 | `[BASELINE]` 前缀 + 全部视频 |
+| state 存在 | 无前缀 + 只列新增 |
+| 新增 = 0 | 报告仍生成，**写"本次没有新增视频"**（不漏跑） |
+| `summary.enabled=true` | **不调 LLM**，博主追踪路径独立于 AI 总结 |
+
+### 行为契约
+
+| 行为 | 说明 |
+|------|------|
+| 不抓 mp4 / 不下载视频 | 主页只读 DOM（aweme_id + 标题 + 卡片可见字段） |
+| 不抓单视频 | **不对新增视频自动跑 `scrapeDouyinPage`**（v0.10+） |
+| 不抓博主"喜欢"tab / 合集 | 只看 `?tab=post`（作品 tab） |
+| 不调 LLM | 博主追踪路径**完全独立**于 summary 层 |
+| 不读 cookie | 全程不调用 `context.cookies()` |
+| 0 改动 v0.7.1 单视频抓取 | `scrapeDouyinPage` 函数体 219 行未变 |
+
+### 已知限制
+
+1. **抖音"作品"分页动态性**：同一博主 8 分钟内两次跑，"新视频"数会变（**不是博主真发了视频**，是抖音分页算法在 session 内变化）。算法忠实于"本次抓到 vs state 已知"的差集。
+2. **粉丝/关注/获赞数值跨次跑有波动**（关注按钮未点 vs 已关注状态不同），**不影响 v0.9 核心功能**（v0.9 不需要这些数做决策）。
+3. **state 文件 = 当前累计**（非历史档案）。删 state = 主动丢弃历史。要保留须先备份。
+
 ## 配置项（config.json）
 
 ```json
@@ -356,6 +441,13 @@ v0.6 写入策略：
   "scrape": {
     "fetch_comments": true,
     "comment_max_count": 10
+  },
+  "creator_tracking": {
+    "tracker_dir": "/mnt/d/ObsidianVault/DouyinTracker",
+    "max_videos_per_creator": 200,
+    "scroll_stable_rounds": 2,
+    "scroll_max_no_change": 5,
+    "scroll_pause_ms": 1500
   }
 }
 ```
@@ -369,6 +461,11 @@ v0.6 写入策略：
 | `browser.wait_after_scroll_ms` | `2000` | 滚动后等评论懒加载 |
 | `scrape.fetch_comments` | `true` | 是否抓评论（关闭后整段跳过） |
 | `scrape.comment_max_count` | `10` | 最多抓多少条评论 |
+| `creator_tracking.tracker_dir` | `/mnt/d/ObsidianVault/DouyinTracker` | 博主追踪根目录（state/reports/queue/logs） |
+| `creator_tracking.max_videos_per_creator` | `200` | 单次单博主抓的视频上限（硬兜底） |
+| `creator_tracking.scroll_stable_rounds` | `2` | 连续 N 次滚动无新即停（九号科技快讯 62 条时验证） |
+| `creator_tracking.scroll_max_no_change` | `5` | 强兜底（防死循环） |
+| `creator_tracking.scroll_pause_ms` | `1500` | 每次滚动后等（触发懒加载） |
 
 ## 抓取内容
 

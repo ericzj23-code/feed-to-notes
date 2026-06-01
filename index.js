@@ -1347,7 +1347,10 @@ async function runCreator(url, options = {}) {
 
     // 写 report
     if (!fs.existsSync(CT_REPORT_DIR)) fs.mkdirSync(CT_REPORT_DIR, { recursive: true });
-    const reportName = `${secUid}-${new Date().toISOString().slice(0, 10)}${isBaseline ? '-BASELINE' : ''}.md`;
+    const now = new Date();
+    const datePart = now.toISOString().slice(0, 10);
+    const timePart = now.toISOString().slice(11, 19).replace(/:/g, '');
+    const reportName = `${secUid}-${datePart}-${timePart}${isBaseline ? '-BASELINE' : ''}.md`;
     const reportFp = path.join(CT_REPORT_DIR, reportName);
     const reportContent = buildCreatorReport(secUid, enriched, stateFp);
     fs.writeFileSync(reportFp, reportContent, 'utf8');
