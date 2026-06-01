@@ -1,6 +1,6 @@
 # douyin-link-to-obsidian
 
-> **当前能力边界**（v0.5 标签对应 `v0.5-batch-queue`）
+> **当前能力边界**（v0.6 标签对应 `v0.6-summary-layer`）
 >
 > | 项 | 状态 |
 > |---|---|
@@ -17,12 +17,13 @@
 > | 股票提及提取 | ✅ 已支持（v0.3 新增，纯正则+静态词典，不调 LLM） |
 > | Obsidian YAML frontmatter | ✅ 已支持（v0.4 新增，10 字段，YAML 合法） |
 > | Dataview 检索友好 | ✅ 已支持（v0.4 新增，按 author / source / tags / mentioned_symbols 检索） |
-> | **批量抓取** | ✅ 已支持（v0.5 新增，`--file urls.txt` 模式） |
-> | **已抓过链接自动跳过** | ✅ 已支持（v0.5 新增，扫描 OUTPUT_DIR 里的 `.json` 文件判定） |
-> | **batch-log.json 输出** | ✅ 已支持（v0.5 新增，追加式记录每次批次的 items + 统计） |
+> | 批量抓取 | ✅ 已支持（v0.5 新增，`--file urls.txt` 模式） |
+> | 已抓过链接自动跳过 | ✅ 已支持（v0.5 新增，扫描 OUTPUT_DIR 里的 `.json` 文件判定） |
+> | batch-log.json 输出 | ✅ 已支持（v0.5 新增，追加式记录每次批次的 items + 统计） |
+> | **AI 总结层（可选）** | ✅ 已支持（v0.6 新增，`summary.enabled` 开关，LLM 失败不影响主流程） |
 > | 字幕 | ❌ 暂不支持 |
 > | 博主主页跟踪 | ❌ 暂不支持（ROADMAP 阶段四明确不做） |
-> | LLM 总结 | ❌ 暂不支持 |
+> | LLM 总结（默认开启） | ❌ 默认关闭，需 `summary.enabled=true` |
 > | 字幕自动展开 | ❌ 暂不支持（需手动点播放器字幕按钮） |
 
 把单条抖音分享链接（短链或长链）抓成 Obsidian Markdown 笔记，落到 `D:\ObsidianVault\Douyin\` 下。
@@ -270,6 +271,74 @@ jq '[.batches[].success] | add' batch-log.json
 # 找所有批次的 skipped 项
 jq '.batches[].items[] | select(.status == "skipped") | .reason' batch-log.json
 ```
+
+## AI 总结层（v0.6，可选）
+
+### 用法
+
+在 `config.json` 里设 `summary.enabled: true`：
+
+```json
+{
+  ...,
+  "summary": {
+    "enabled": true,
+    "provider": "minimax-cn",
+    "model": "MiniMax-M2.7",
+    "base_url": "https://api.minimaxi.com/anthropic",
+    "max_tokens": 1024,
+    "timeout_ms": 30000
+  }
+}
+```
+
+环境变量需要任一 `MINIMAX_CN_KEY` / `HERMES_MINIMAX_KEY` / `ANTHROPIC_API_KEY`。
+
+### 行为契约
+
+| 场景 | 行为 |
+|------|------|
+| `enabled=false` | 完全不调 LLM，`summary` 字段为 null |
+| `enabled=true` + 有 key + LLM 成功 | 调 LLM，5 字段写入 `data.summary`，**重写** .md/.json（追加 AI 总结段） |
+| `enabled=true` + 无 key | warn "未找到 API key"，跳过，文件保留原始内容 |
+| `enabled=true` + 网络错/超时/JSON 错 | warn "AI 总结失败"，**主流程不受影响**，文件保留原始内容 |
+| `enabled=true` + LLM 成功 | 5 字段：`viewpoints` / `risks` / `mentioned_symbols` / `follow_ups` / `replicable_takeaways` |
+
+### 不覆盖原始内容
+
+v0.6 写入策略：
+1. **先生成**原始 .md + .json（不带 summary）
+2. **再调** LLM（不影响主流程）
+3. **只在 LLM 成功时**把 summary 注入 data 并**重写**两个文件（追加 AI 总结段到末尾）
+
+原始 frontmatter / 元数据表 / 章节 / 评论 / 抓取日志**全程不被修改**。
+
+### JSON 字段
+
+```json
+{
+  ...其他字段...,
+  "summary": {
+    "viewpoints": ["...", "..."],
+    "risks": ["..."],
+    "mentioned_symbols": [{"kind": "a_stock_name", "value": "..."}],
+    "follow_ups": ["..."],
+    "replicable_takeaways": ["..."],
+    "_meta": {
+      "provider": "minimax-cn",
+      "model": "MiniMax-M2.7",
+      "generated_at": "2026-06-01T..."
+    }
+  }
+}
+```
+
+### 已知限制
+
+- **WSL 环境下 Node 的 `fetch()` 不走 `HTTPS_PROXY` 环境变量**——如果你 WSL 里配了代理（`HTTPS_PROXY=http://127.0.0.1:7897`），LLM 调用仍会失败（`fetch failed` / 超时）。解决方案：
+  1. 在 Windows PowerShell 跑脚本（不走 WSL 代理）
+  2. 等 v0.7 增加 undici ProxyAgent 支持（v0.6 范围外）
+- API key 必须**有 Anthropic-compatible 端点权限**（MiniMax CN 默认走 `/anthropic/v1/messages`）
 
 ## 配置项（config.json）
 

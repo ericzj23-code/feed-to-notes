@@ -34,6 +34,14 @@ const WAIT_AFTER_SCROLL_MS = CONFIG.browser?.wait_after_scroll_ms || 2000;
 const FETCH_COMMENTS = CONFIG.scrape?.fetch_comments !== false;
 const COMMENT_MAX_COUNT = CONFIG.scrape?.comment_max_count || 10;
 
+// v0.6: AI 总结层（可选）
+const SUMMARY_ENABLED = CONFIG.summary?.enabled === true;
+const SUMMARY_PROVIDER = CONFIG.summary?.provider || 'minimax-cn';
+const SUMMARY_MODEL = CONFIG.summary?.model || 'MiniMax-M2.7';
+const SUMMARY_BASE_URL = CONFIG.summary?.base_url || 'https://api.minimaxi.com/anthropic';
+const SUMMARY_MAX_TOKENS = CONFIG.summary?.max_tokens || 1024;
+const SUMMARY_TIMEOUT_MS = CONFIG.summary?.timeout_ms || 30000;
+
 // ============================================================
 // 日志工具
 // ============================================================
@@ -454,6 +462,41 @@ function buildMarkdown(data) {
     blocks.push('');
   }
 
+  // v0.6: AI 总结（仅 enabled 且 data.summary 存在时）
+  if (data.summary) {
+    const s = data.summary;
+    blocks.push('## AI 总结（v0.6，可选层）', '');
+    if (s._meta) {
+      blocks.push(`> 模型: ${s._meta.provider}/${s._meta.model}，生成时间: ${s._meta.generated_at}`);
+      blocks.push('');
+    }
+    if (s.viewpoints?.length) {
+      blocks.push('### 观点', '');
+      s.viewpoints.forEach(v => blocks.push(`- ${v}`));
+      blocks.push('');
+    }
+    if (s.risks?.length) {
+      blocks.push('### 风险', '');
+      s.risks.forEach(v => blocks.push(`- ${v}`));
+      blocks.push('');
+    }
+    if (s.mentioned_symbols?.length) {
+      blocks.push('### AI 提及的标的', '');
+      s.mentioned_symbols.forEach(x => blocks.push(`- ${x.kind}: ${x.value}`));
+      blocks.push('');
+    }
+    if (s.follow_ups?.length) {
+      blocks.push('### 可跟踪问题', '');
+      s.follow_ups.forEach(v => blocks.push(`- ${v}`));
+      blocks.push('');
+    }
+    if (s.replicable_takeaways?.length) {
+      blocks.push('### 可模仿点', '');
+      s.replicable_takeaways.forEach(v => blocks.push(`- ${v}`));
+      blocks.push('');
+    }
+  }
+
   // 抓取日志（透明化失败点）
   blocks.push('## 抓取日志', '');
   blocks.push('```', `[INFO] 导航: ${data.finalUrl || data.inputUrl}`, `[INFO] 章节: ${data.chapters.length} 条`, `[INFO] 评论: ${data.comments.length} 条`, `[INFO] 字幕: 未获取`, `[INFO] 抓取完成: ${now.toISOString()}`, '```', '');
@@ -555,9 +598,161 @@ function buildJson(data) {
       // raw_payload 不含 cookie（本来就没读）也不含 mp4 URL
     },
     failure_log: [...FAILURE_LOG],  // 拷贝一份，避免后续操作影响原数组
+    // v0.6: AI 总结（仅 enabled 且 LLM 成功时存在；LLM 失败时为 null）
+    summary: data.summary || null,
   };
 
   return JSON.stringify(obj, null, 2) + '\n';
+}
+
+// ============================================================
+// AI 总结层（v0.6，可选，不影响主流程）
+// ============================================================
+function buildSummaryPrompt(data) {
+  // 拼一个简洁的"视频元数据卡"喂给 LLM
+  const lines = [
+    `标题: ${data.title || '(未知)'}`,
+    `作者: ${data.author || '(未知)'}`,
+    `发布时间: ${data.publishTime || '(未知)'}`,
+    `原始链接: ${data.finalUrl || data.inputUrl || ''}`,
+    '',
+  ];
+  if (data.chapters && data.chapters.length) {
+    lines.push('章节:');
+    data.chapters.forEach((c, i) => lines.push(`  ${i + 1}. ${c}`));
+    lines.push('');
+  }
+  if (data.comments && data.comments.length) {
+    lines.push('热门评论（按赞数排序的前 5 条）:');
+    data.comments
+      .slice()
+      .sort((a, b) => (parseInt(b.likes) || 0) - (parseInt(a.likes) || 0))
+      .slice(0, 5)
+      .forEach(c => lines.push(`  - ${c.user} (${c.likes}赞): ${c.text}`));
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+function parseSummaryJson(text) {
+  // LLM 经常输出 markdown 包装或前后杂字，先 strip 再 parse
+  // 策略：找第一个 { 和最后一个 } 之间的内容
+  if (!text) return null;
+  const trimmed = String(text).trim();
+  // 去掉 ```json ... ``` 包装
+  let s = trimmed;
+  const fenceMatch = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) s = fenceMatch[1].trim();
+  // 找第一个 { 到最后一个 }
+  const first = s.indexOf('{');
+  const last = s.lastIndexOf('}');
+  if (first >= 0 && last > first) {
+    s = s.slice(first, last + 1);
+  }
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function callSummaryLLM(data) {
+  if (!SUMMARY_ENABLED) return null;
+
+  // API key 解析（按优先级）
+  const apiKey = process.env.MINIMAX_CN_KEY
+    || process.env.HERMES_MINIMAX_KEY
+    || process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    log('WARN', 'summary.enabled=true 但未找到 API key (MINIMAX_CN_KEY / HERMES_MINIMAX_KEY / ANTHROPIC_API_KEY)，跳过');
+    return null;
+  }
+
+  const systemPrompt = `你是内容分析专家。严格按 JSON 输出，不要 markdown 包装，不要解释。`;
+  const userPrompt = `分析下面的抖音视频元数据，输出 JSON 5 字段（每个字段值是数组）：
+
+- viewpoints: 创作者核心观点（1-3 条，每条 1 句话）
+- risks: 投资/逻辑风险（0-3 条）
+- mentioned_symbols: 提及的标的（数组，每项含 kind 字段: a_stock_name / a_stock_code / hk_stock_code，value 字段是名字或代码）
+- follow_ups: 看完会想跟踪的问题（0-3 条）
+- replicable_takeaways: 内容创作侧的可模仿点（0-3 条）
+
+${buildSummaryPrompt(data)}`;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), SUMMARY_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(`${SUMMARY_BASE_URL}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: SUMMARY_MODEL,
+        max_tokens: SUMMARY_MAX_TOKENS,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userPrompt }],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      log('WARN', `LLM HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      return null;
+    }
+
+    const respJson = await res.json();
+    const text = respJson?.content?.[0]?.text || null;
+    if (!text) {
+      log('WARN', 'LLM 返回空 content');
+      return null;
+    }
+
+    const parsed = parseSummaryJson(text);
+    if (!parsed) {
+      log('WARN', `LLM 返回无法解析为 JSON: ${text.slice(0, 200)}`);
+      return null;
+    }
+
+    // 标准化字段（防止 LLM 返回奇怪的 key）
+    return {
+      viewpoints: Array.isArray(parsed.viewpoints) ? parsed.viewpoints : [],
+      risks: Array.isArray(parsed.risks) ? parsed.risks : [],
+      mentioned_symbols: Array.isArray(parsed.mentioned_symbols) ? parsed.mentioned_symbols : [],
+      follow_ups: Array.isArray(parsed.follow_ups) ? parsed.follow_ups : [],
+      replicable_takeaways: Array.isArray(parsed.replicable_takeaways) ? parsed.replicable_takeaways : [],
+      _meta: {
+        provider: SUMMARY_PROVIDER,
+        model: SUMMARY_MODEL,
+        generated_at: new Date().toISOString(),
+      },
+    };
+  } catch (e) {
+    log('WARN', `LLM 调用失败: ${e.message}`);
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function enrichWithSummary(data) {
+  if (!SUMMARY_ENABLED) return data;
+  log('INFO', 'AI 总结层启用，调用 LLM...');
+  const summary = await callSummaryLLM(data);
+  if (summary) {
+    data.summary = summary;
+    const n = (summary.viewpoints?.length || 0) + (summary.risks?.length || 0) +
+              (summary.mentioned_symbols?.length || 0) + (summary.follow_ups?.length || 0) +
+              (summary.replicable_takeaways?.length || 0);
+    log('INFO', `AI 总结完成: 共 ${n} 条`);
+  } else {
+    log('WARN', 'AI 总结失败，继续（不影响主流程）');
+  }
+  return data;
 }
 
 // ============================================================
@@ -676,6 +871,19 @@ async function processOneUrl(url, browser, sharedContext, options = {}) {
     const jsonFilepath = filepath.replace(/\.md$/, '.json');
     fs.writeFileSync(jsonFilepath, buildJson(data), 'utf8');
     log('SUCCESS', `已保存: ${jsonFilepath}`);
+
+    // v0.6: AI 总结层（在原始内容已写盘后追加，不影响主流程）
+    // 失败时不重写文件，原始内容保留；成功时把 summary 注入 data 并重写文件
+    try {
+      await enrichWithSummary(data);
+      if (data.summary) {
+        fs.writeFileSync(filepath, buildMarkdown(data), 'utf8');
+        fs.writeFileSync(jsonFilepath, buildJson(data), 'utf8');
+        log('SUCCESS', `已附加 AI 总结到: ${filepath}`);
+      }
+    } catch (e) {
+      log('WARN', `AI 总结层异常（已忽略）: ${e.message}`);
+    }
 
     result.status = 'success';
     result.file = filepath;

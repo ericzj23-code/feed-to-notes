@@ -11,5 +11,13 @@
   "scrape": {
     "fetch_comments": true,
     "comment_max_count": 10
+  },
+  "summary": {
+    "enabled": false,
+    "provider": "minimax-cn",
+    "model": "MiniMax-M2.7",
+    "base_url": "https://api.minimaxi.com/anthropic",
+    "max_tokens": 1024,
+    "timeout_ms": 30000
   }
 }
