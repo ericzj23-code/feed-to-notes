@@ -1,6 +1,6 @@
 # douyin-link-to-obsidian
 
-> **当前能力边界**（v0.2 标签对应 `v0.2-stability`）
+> **当前能力边界**（v0.3 标签对应 `v0.3-json-output`）
 >
 > | 项 | 状态 |
 > |---|---|
@@ -12,6 +12,9 @@
 > | 章节 / 文案 | ✅ 章节已支持稳定（自适应等待连续 2 次相同章节数） |
 > | 评论 | ✅ 已支持（默认 10 条，可配置） |
 > | 抓取日志 | ✅ 已支持（写入 md 文件 + 控制台输出） |
+> | Markdown 输出 | ✅ 已支持（`.md` 文件含 frontmatter + 元数据表 + 章节/评论表格） |
+> | **结构化 JSON 输出** | ✅ 已支持（v0.3 新增，`.json` 与 `.md` 同名同目录，14 个字段） |
+> | **股票提及提取** | ✅ 已支持（v0.3 新增，纯正则+静态词典，不调 LLM） |
 > | 字幕 | ❌ 暂不支持 |
 > | 博主主页跟踪 | ❌ 暂不支持 |
 > | 批量抓取 | ❌ 暂不支持 |
@@ -100,6 +103,37 @@ D:\ObsidianVault\Douyin\2026-06-01-机构一手调研（福总）-韬定律刷�
 - 连续空白/横线合并
 - 截断到 80 字符
 - 重名追加 `-HHMMSS` 时间戳
+
+> **v0.3 新增**：每次抓取同时生成同名 `.json` 文件（与 `.md` 同目录）。结构化字段便于程序消费。
+> jq 消费示例：
+> ```bash
+> jq -r '"\(.scraped_at) \(.author): \(.title)"' *.json
+> jq -r '.mentioned_symbols[]? | "\(.kind): \(.value)"' *.json | sort -u
+> ```
+
+## JSON 输出字段（v0.3）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `source_name` | string | 固定 `"douyin"`（平台标识） |
+| `source_level` | string | 固定 `"video"`（来源类型） |
+| `source_url` | string | 用户输入的原始 URL（短链） |
+| `final_url` | string | 跳转后的 URL（带 `video_id` 的长链） |
+| `author` | string \| null | 视频作者 |
+| `title` | string \| null | 视频标题 |
+| `published_at` | string \| null | 发布时间（保持抖音原文本格式，不强行转 ISO） |
+| `content_text` | string | 章节 + 热门评论拼成的纯文本描述（v0.3 没有正文文案时的替身） |
+| `chapters` | string[] | 章节列表（HH:MM 开头） |
+| `comments` | object[] | 评论列表，每条含 `user` / `time` / `likes` / `text` |
+| `mentioned_symbols` | object[] | 提及的股票，`{kind, value}` 结构 |
+| `scraped_at` | string (ISO) | 抓取完成时间 |
+| `raw_payload` | object | 原始抓取数据（`video_id` + `stats`）；不含 cookie / mp4 URL |
+| `failure_log` | object[] | 失败原因汇总（reason / detail / at） |
+
+**`mentioned_symbols` 提取策略**（v0.3 轻量版，不调 LLM）：
+1. 静态词典匹配（`KNOWN_A_STOCKS` 数组里的中文股票名）
+2. A 股代码正则 `\b[036]\d{5}\b`（以 0/3/6 开头避免误匹）
+3. 港股代码正则 `\b\d{4,5}\.HK\b`
 
 ## 配置项（config.json）
 

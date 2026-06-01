@@ -428,6 +428,105 @@ function buildMarkdown(data) {
 }
 
 // ============================================================
+// 股票词典（v0.3 轻量版，纯正则+静态词典，不用 LLM）
+// ============================================================
+const KNOWN_A_STOCKS = [
+  // 评论区/章节里出现过的标的
+  '长电科技', '深科技', '太极实业', '晶方科技', '利通电子', '盛合晶微',
+  '彩虹股份', '京东方', '蓝思科技', '沃格光电', '立讯精密', '海康威视',
+  '寒武纪', '海光信息', '中芯国际', '华大九天', '芯动科技', '浪潮信息',
+  '华为', '意华股份', '瑞芯微', '超讯通信', '昇腾', '玄戒', '玻基',
+  // A 股 6 位代码前缀是 60/30/00/68/20 等，识别不靠名字靠数字
+];
+
+function extractMentionedSymbols(data) {
+  const symbols = [];
+  const seen = new Set();
+
+  // 把章节和评论拼成大文本
+  const blob = [
+    (data.title || ''),
+    (data.author || ''),
+    ...(data.chapters || []),
+    ...(data.comments || []).map(c => c.text || ''),
+  ].join('\n');
+
+  // 1) 静态词典匹配（中文股票名）
+  for (const name of KNOWN_A_STOCKS) {
+    if (blob.includes(name) && !seen.has(`name:${name}`)) {
+      symbols.push({ kind: 'a_stock_name', value: name });
+      seen.add(`name:${name}`);
+    }
+  }
+
+  // 2) A 股 6 位代码（必须以 0/3/6 开头避免误匹）
+  const aCodes = blob.match(/\b[036]\d{5}\b/g) || [];
+  for (const code of aCodes) {
+    if (!seen.has(`code:${code}`)) {
+      symbols.push({ kind: 'a_stock_code', value: code });
+      seen.add(`code:${code}`);
+    }
+  }
+
+  // 3) 港股代码：4-5 位数字 + .HK
+  const hkCodes = blob.match(/\b\d{4,5}\.HK\b/gi) || [];
+  for (const code of hkCodes) {
+    if (!seen.has(`hk:${code}`)) {
+      symbols.push({ kind: 'hk_stock_code', value: code.toUpperCase() });
+      seen.add(`hk:${code}`);
+    }
+  }
+
+  return symbols;
+}
+
+// ============================================================
+// JSON 输出
+// ============================================================
+function buildJson(data) {
+  // content_text：用 chapters + 关键评论拼一段纯文本描述（v0.3 没有正文文案）
+  const contentParts = [];
+  if (data.chapters.length) {
+    contentParts.push('【章节】\n' + data.chapters.map((c, i) => `${i + 1}. ${c}`).join('\n'));
+  }
+  if (data.comments.length) {
+    const topComments = data.comments.slice(0, 5)
+      .map(c => `  - ${c.user} (${c.likes}赞): ${c.text}`)
+      .join('\n');
+    contentParts.push('【热门评论】\n' + topComments);
+  }
+  if (data.subtitle) {
+    contentParts.push('【字幕】\n' + data.subtitle);
+  }
+  const contentText = contentParts.length ? contentParts.join('\n\n') : '';
+
+  const mentionedSymbols = extractMentionedSymbols(data);
+
+  const obj = {
+    source_name: 'douyin',
+    source_level: 'video',
+    source_url: data.inputUrl || data.finalUrl || '',
+    final_url: data.finalUrl || data.inputUrl || '',
+    author: data.author || null,
+    title: data.title || null,
+    published_at: data.publishTime || null,
+    content_text: contentText,
+    chapters: data.chapters || [],
+    comments: data.comments || [],
+    mentioned_symbols: mentionedSymbols,
+    scraped_at: new Date().toISOString(),
+    raw_payload: {
+      video_id: data.videoId || null,
+      stats: data.stats || null,
+      // raw_payload 不含 cookie（本来就没读）也不含 mp4 URL
+    },
+    failure_log: [...FAILURE_LOG],  // 拷贝一份，避免后续操作影响原数组
+  };
+
+  return JSON.stringify(obj, null, 2) + '\n';
+}
+
+// ============================================================
 // 主流程
 // ============================================================
 async function main() {
@@ -501,8 +600,19 @@ async function main() {
       filepath = path.join(OUTPUT_DIR, `${path.parse(filename).name}-${ts}${path.extname(filename)}`);
     }
 
+    // v0.3: 同时写 .md 和 .json（同名不同后缀）
     fs.writeFileSync(filepath, buildMarkdown(data), 'utf8');
     log('SUCCESS', `已保存: ${filepath}`);
+
+    const jsonFilepath = filepath.replace(/\.md$/, '.json');
+    fs.writeFileSync(jsonFilepath, buildJson(data), 'utf8');
+    log('SUCCESS', `已保存: ${jsonFilepath}`);
+
+    // v0.3: 提及股票摘要
+    const symbols = extractMentionedSymbols(data);
+    if (symbols.length) {
+      console.log(`提及股票: ${symbols.length} 个 → ${symbols.slice(0, 8).map(s => s.value).join(', ')}${symbols.length > 8 ? '...' : ''}`);
+    }
 
     // 摘要输出
     console.log('\n----- 抓取摘要 -----');
