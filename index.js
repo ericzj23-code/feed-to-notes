@@ -561,43 +561,80 @@ function buildJson(data) {
 }
 
 // ============================================================
-// 主流程
+// urls.txt 解析
 // ============================================================
-async function main() {
-  const url = process.argv[2];
-
-  if (!url) {
-    console.error('用法: node index.js "<douyin_url>"');
-    console.error('示例: node index.js "https://v.douyin.com/2vX7spOC_sg/"');
-    process.exit(1);
+function parseUrlsFile(filepath) {
+  if (!fs.existsSync(filepath)) {
+    throw new Error(`urls 文件不存在: ${filepath}`);
   }
-  if (!isValidDouyinUrl(url)) {
-    console.error('[ERROR] 不是有效的抖音链接（必须含 douyin.com）');
-    process.exit(1);
+  const text = fs.readFileSync(filepath, 'utf8');
+  const lines = text.split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('#'));
+  return lines;
+}
+
+// ============================================================
+// 已抓过链接扫描（看 OUTPUT_DIR 里 .json 的 source_url/final_url）
+// ============================================================
+function scanAlreadyScraped() {
+  const seen = new Map();  // url -> filepath
+  if (!fs.existsSync(OUTPUT_DIR)) return seen;
+
+  const files = fs.readdirSync(OUTPUT_DIR).filter(f => f.endsWith('.json'));
+  for (const f of files) {
+    const full = path.join(OUTPUT_DIR, f);
+    try {
+      const obj = JSON.parse(fs.readFileSync(full, 'utf8'));
+      if (obj.source_url) seen.set(obj.source_url, full);
+      if (obj.final_url && obj.final_url !== obj.source_url) seen.set(obj.final_url, full);
+    } catch (e) {
+      // JSON 损坏不影响扫描
+    }
+  }
+  return seen;
+}
+
+// ============================================================
+// 单条 URL 处理（被 main / batch 复用）
+// ============================================================
+async function processOneUrl(url, browser, sharedContext, options = {}) {
+  const { isBatch = false } = options;
+  const startedAt = Date.now();
+  const result = {
+    url,
+    status: 'failed',  // success / skipped / failed
+    file: null,
+    reason: null,
+    failure_log: [],
+    elapsed_ms: 0,
+  };
+
+  // 已抓过检查
+  const alreadyScraped = scanAlreadyScraped();
+  if (alreadyScraped.has(url)) {
+    result.status = 'skipped';
+    result.reason = `已抓过 (匹配文件: ${path.basename(alreadyScraped.get(url))})`;
+    result.elapsed_ms = Date.now() - startedAt;
+    log('INFO', `跳过（已抓过）: ${url}`);
+    return result;
   }
 
-  console.log('========================================');
-  log('INFO', 'douyin-link-to-obsidian');
-  log('INFO', `配置: output=${OUTPUT_DIR}, cdp=${CDP_URL}, comments=${FETCH_COMMENTS ? `${COMMENT_MAX_COUNT}条` : 'off'}`);
-  console.log('========================================');
+  // 清空 FAILURE_LOG（避免跨 URL 串）
+  FAILURE_LOG.length = 0;
 
-  let browser;
   let page;
-  let data = null;
-  let filepath = null;
-
   try {
-    browser = await connectBrowser();
+    // 每条 URL 用独立 page（共享 context 减少资源）
+    page = await sharedContext.newPage();
+    const context = page;  // 兼容旧代码
 
-    // 在共享 CDP 中建一个独立 context，避免污染你 Edge 已有 tab
-    const context = await browser.newContext();
-    page = await context.newPage();
-
-    // 抓取（带重试：网络/CDP 错误重试 1 次）
+    // 抓取（带重试）
     const RETRY_DELAY_MS = 1000;
     let attempts = 0;
     const maxAttempts = 2;
     let lastError = null;
+    let data = null;
     while (attempts < maxAttempts) {
       attempts++;
       try {
@@ -616,7 +653,7 @@ async function main() {
       throw lastError || new Error('抓取失败且无更多错误信息');
     }
 
-    // 验收检查：标题/作者/文案 至少一项
+    // 验收检查
     const hit = [data.title, data.author, data.publishTime].filter(Boolean).length;
     if (hit === 0) {
       fail('关键字段全空', '标题/作者/发布时间 都未抓到，可能被反爬或登录态失效');
@@ -626,15 +663,13 @@ async function main() {
     // 写文件
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     const filename = buildFilename(data);
-    filepath = path.join(OUTPUT_DIR, filename);
+    let filepath = path.join(OUTPUT_DIR, filename);
 
-    // 重名追加时间戳
     if (fs.existsSync(filepath)) {
       const ts = new Date().toISOString().slice(11, 19).replace(/:/g, '');
       filepath = path.join(OUTPUT_DIR, `${path.parse(filename).name}-${ts}${path.extname(filename)}`);
     }
 
-    // v0.3: 同时写 .md 和 .json（同名不同后缀）
     fs.writeFileSync(filepath, buildMarkdown(data), 'utf8');
     log('SUCCESS', `已保存: ${filepath}`);
 
@@ -642,43 +677,198 @@ async function main() {
     fs.writeFileSync(jsonFilepath, buildJson(data), 'utf8');
     log('SUCCESS', `已保存: ${jsonFilepath}`);
 
-    // v0.3: 提及股票摘要
-    const symbols = extractMentionedSymbols(data);
-    if (symbols.length) {
-      console.log(`提及股票: ${symbols.length} 个 → ${symbols.slice(0, 8).map(s => s.value).join(', ')}${symbols.length > 8 ? '...' : ''}`);
+    result.status = 'success';
+    result.file = filepath;
+    result.json_file = jsonFilepath;
+    result.failure_log = [...FAILURE_LOG];
+
+    // 摘要（单条模式才打印，批量模式每条都打太长）
+    if (!isBatch) {
+      const symbols = extractMentionedSymbols(data);
+      if (symbols.length) {
+        console.log(`提及股票: ${symbols.length} 个 → ${symbols.slice(0, 8).map(s => s.value).join(', ')}${symbols.length > 8 ? '...' : ''}`);
+      }
+      console.log('\n----- 抓取摘要 -----');
+      console.log(`标题: ${data.title || '(空)'}`);
+      console.log(`作者: ${data.author || '(空)'}`);
+      console.log(`发布时间: ${data.publishTime || '(空)'}`);
+      console.log(`章节: ${data.chapters.length} 条`);
+      console.log(`评论: ${data.comments.length} 条`);
+      console.log(`字幕: 未获取`);
+      console.log('--------------------\n');
     }
-
-    // 摘要输出
-    console.log('\n----- 抓取摘要 -----');
-    console.log(`标题: ${data.title || '(空)'}`);
-    console.log(`作者: ${data.author || '(空)'}`);
-    console.log(`发布时间: ${data.publishTime || '(空)'}`);
-    console.log(`章节: ${data.chapters.length} 条`);
-    console.log(`评论: ${data.comments.length} 条`);
-    console.log(`字幕: 未获取`);
-    console.log('--------------------\n');
-
   } catch (e) {
-    fail('主流程异常', e.message);
-    console.error(e.stack);
+    result.status = 'failed';
+    result.reason = e.message;
+    result.failure_log = [...FAILURE_LOG];
+    fail('抓取异常', e.message);
+    if (!isBatch) console.error(e.stack);
   } finally {
-    // 关闭 context（不关闭 browser，因为是共用的）
     if (page) {
-      try { await page.context().close(); } catch {}
+      try { await page.close(); } catch {}
     }
+    result.elapsed_ms = Date.now() - startedAt;
+  }
 
-    // 失败时输出失败原因 + 抓取日志
-    if (FAILURE_LOG.length > 0) {
+  return result;
+}
+
+// ============================================================
+// 主流程
+// ============================================================
+async function runSingle(url) {
+  console.log('========================================');
+  log('INFO', 'douyin-link-to-obsidian (单条模式)');
+  log('INFO', `配置: output=${OUTPUT_DIR}, cdp=${CDP_URL}, comments=${FETCH_COMMENTS ? `${COMMENT_MAX_COUNT}条` : 'off'}`);
+  console.log('========================================');
+
+  let browser;
+  try {
+    browser = await connectBrowser();
+    const context = await browser.newContext();
+    const result = await processOneUrl(url, browser, context, { isBatch: false });
+    return result;
+  } catch (e) {
+    log('ERROR', `主流程异常: ${e.message}`);
+    return { url, status: 'failed', reason: e.message, failure_log: [...FAILURE_LOG] };
+  }
+}
+
+async function runBatch(urlsFile) {
+  console.log('========================================');
+  log('INFO', 'douyin-link-to-obsidian (批量模式)');
+  log('INFO', `urls 文件: ${urlsFile}`);
+  log('INFO', `配置: output=${OUTPUT_DIR}, cdp=${CDP_URL}, comments=${FETCH_COMMENTS ? `${COMMENT_MAX_COUNT}条` : 'off'}`);
+  console.log('========================================');
+
+  let urls;
+  try {
+    urls = parseUrlsFile(urlsFile);
+  } catch (e) {
+    log('ERROR', e.message);
+    return null;
+  }
+
+  if (urls.length === 0) {
+    log('ERROR', `urls 文件为空或全部是注释: ${urlsFile}`);
+    return null;
+  }
+  log('INFO', `共 ${urls.length} 条 URL`);
+
+  // 校验所有 URL
+  const invalid = urls.filter(u => !isValidDouyinUrl(u));
+  if (invalid.length) {
+    log('WARN', `${invalid.length} 条 URL 不是 douyin.com，已跳过: ${invalid.slice(0, 3).join(', ')}...`);
+    urls = urls.filter(u => isValidDouyinUrl(u));
+  }
+
+  const batchStartedAt = new Date().toISOString();
+  const items = [];
+  let browser, context;
+
+  try {
+    browser = await connectBrowser();
+    context = await browser.newContext();
+
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i];
+      console.log(`\n[${i + 1}/${urls.length}] ${url}`);
+      const result = await processOneUrl(url, browser, context, { isBatch: true });
+      items.push(result);
+      // 条目之间间隔 1s（防止抖音反爬）
+      if (i < urls.length - 1) {
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+  } catch (e) {
+    log('ERROR', `批量主流程异常: ${e.message}`);
+  } finally {
+    if (context) {
+      try { await context.close(); } catch {}
+    }
+  }
+
+  const batchFinishedAt = new Date().toISOString();
+  const summary = {
+    batch_started_at: batchStartedAt,
+    batch_finished_at: batchFinishedAt,
+    total: items.length,
+    success: items.filter(i => i.status === 'success').length,
+    skipped: items.filter(i => i.status === 'skipped').length,
+    failed: items.filter(i => i.status === 'failed').length,
+    items,
+  };
+
+  // 写 batch-log.json
+  const logPath = path.join(OUTPUT_DIR, 'batch-log.json');
+  // 如果已有就追加（保留历史）
+  let existingLog = [];
+  if (fs.existsSync(logPath)) {
+    try {
+      const prev = JSON.parse(fs.readFileSync(logPath, 'utf8'));
+      existingLog = Array.isArray(prev) ? prev : (prev.batches || []);
+    } catch (e) {}
+  }
+  existingLog.push(summary);
+  fs.writeFileSync(logPath, JSON.stringify({ batches: existingLog }, null, 2) + '\n', 'utf8');
+  log('SUCCESS', `已保存: ${logPath}`);
+
+  // 打印汇总
+  console.log('\n========== 批量抓取汇总 ==========');
+  console.log(`总数: ${summary.total}`);
+  console.log(`成功: ${summary.success}`);
+  console.log(`跳过（已抓过）: ${summary.skipped}`);
+  console.log(`失败: ${summary.failed}`);
+  console.log(`总耗时: ${((new Date(batchFinishedAt) - new Date(batchStartedAt)) / 1000).toFixed(1)}s`);
+  console.log('====================================');
+
+  return summary;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+
+  // 批量模式：node index.js --file urls.txt
+  if (args[0] === '--file' || args[0] === '-f') {
+    const urlsFile = args[1];
+    if (!urlsFile) {
+      console.error('用法: node index.js --file <urls.txt>');
+      process.exit(1);
+    }
+    const summary = await runBatch(urlsFile);
+    if (!summary) process.exit(1);
+    // 批量模式：只要有 failed 就 exit 1
+    process.exit(summary.failed > 0 ? 1 : 0);
+  }
+
+  // 单条模式：node index.js "<url>"
+  const url = args[0];
+  if (!url) {
+    console.error('用法:');
+    console.error('  单条: node index.js "<douyin_url>"');
+    console.error('  批量: node index.js --file <urls.txt>');
+    console.error('示例: node index.js "https://v.douyin.com/2vX7spOC_sg/"');
+    process.exit(1);
+  }
+  if (!isValidDouyinUrl(url)) {
+    console.error('[ERROR] 不是有效的抖音链接（必须含 douyin.com）');
+    process.exit(1);
+  }
+
+  const result = await runSingle(url);
+
+  if (result.status === 'failed') {
+    if (result.failure_log && result.failure_log.length > 0) {
       console.log('\n========== 失败原因汇总 ==========');
-      FAILURE_LOG.forEach((f, i) => {
+      result.failure_log.forEach((f, i) => {
         console.log(`${i + 1}. [${f.at}] ${f.reason}`);
         if (f.detail) console.log(`   详情: ${f.detail}`);
       });
       console.log('====================================');
     }
-
-    process.exit(FAILURE_LOG.length > 0 ? 1 : 0);
+    process.exit(1);
   }
+  process.exit(0);
 }
 
 main();

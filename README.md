@@ -1,6 +1,6 @@
 # douyin-link-to-obsidian
 
-> **当前能力边界**（v0.4 标签对应 `v0.4-obsidian-polish`）
+> **当前能力边界**（v0.5 标签对应 `v0.5-batch-queue`）
 >
 > | 项 | 状态 |
 > |---|---|
@@ -15,11 +15,13 @@
 > | Markdown 输出 | ✅ 已支持（`.md` 文件含 frontmatter + 元数据表 + 章节/评论表格） |
 > | 结构化 JSON 输出 | ✅ 已支持（v0.3 新增，`.json` 与 `.md` 同名同目录，14 个字段） |
 > | 股票提及提取 | ✅ 已支持（v0.3 新增，纯正则+静态词典，不调 LLM） |
-> | **Obsidian YAML frontmatter** | ✅ 已支持（v0.4 新增，10 字段，YAML 合法） |
-> | **Dataview 检索友好** | ✅ 已支持（v0.4 新增，按 author / source / tags / mentioned_symbols 检索） |
+> | Obsidian YAML frontmatter | ✅ 已支持（v0.4 新增，10 字段，YAML 合法） |
+> | Dataview 检索友好 | ✅ 已支持（v0.4 新增，按 author / source / tags / mentioned_symbols 检索） |
+> | **批量抓取** | ✅ 已支持（v0.5 新增，`--file urls.txt` 模式） |
+> | **已抓过链接自动跳过** | ✅ 已支持（v0.5 新增，扫描 OUTPUT_DIR 里的 `.json` 文件判定） |
+> | **batch-log.json 输出** | ✅ 已支持（v0.5 新增，追加式记录每次批次的 items + 统计） |
 > | 字幕 | ❌ 暂不支持 |
-> | 博主主页跟踪 | ❌ 暂不支持 |
-> | 批量抓取 | ❌ 暂不支持 |
+> | 博主主页跟踪 | ❌ 暂不支持（ROADMAP 阶段四明确不做） |
 > | LLM 总结 | ❌ 暂不支持 |
 > | 字幕自动展开 | ❌ 暂不支持（需手动点播放器字幕按钮） |
 
@@ -206,6 +208,67 @@ mentioned_symbols:
     value: 昇腾
 tags: [douyin, 抖音, stock/长电科技, stock/深科技, stock/太极实业, stock/利通电子, stock/盛合晶微, stock/中芯国际, stock/华为, stock/昇腾]
 ---
+```
+
+## 批量抓取（v0.5）
+
+### 用法
+
+```bash
+# 准备 urls.txt（每行一条 URL，# 开头是注释，空行被忽略）
+cat > urls.txt <<'EOF'
+# 韬定律专题
+https://v.douyin.com/2vX7spOC_sg/
+https://www.douyin.com/shipin/7644729891430336512
+EOF
+
+# 跑
+node index.js --file urls.txt
+```
+
+### 行为
+
+| 行为 | 说明 |
+|------|------|
+| 单条失败不影响后续 | 每条 URL 独立 try/catch，失败后下一条继续 |
+| 已抓过链接跳过 | 扫 `OUTPUT_DIR` 里所有 `.json` 的 `source_url` / `final_url`，匹配到就 skip |
+| 章节之间间隔 1 秒 | 防抖音反爬（不会瞬时大量请求） |
+| 生成 `batch-log.json` | 追加式记录每个批次（不覆盖历史），含 items + 统计 |
+| 非 douyin.com URL | 整批过滤前会 warn，跳过无效行 |
+| `zhuanti/` 等非视频页 | 抓"全空"但仍写文件（继承 v0.1 单条行为，**算 success**，failure_log 有记录） |
+| exit code | 0 = 全部 success 或 skipped；1 = 有 failed |
+
+### batch-log.json 格式
+
+```json
+{
+  "batches": [
+    {
+      "batch_started_at": "2026-06-01T08:29:48.581Z",
+      "batch_finished_at": "2026-06-01T08:30:57.417Z",
+      "total": 10,
+      "success": 8,
+      "skipped": 2,
+      "failed": 0,
+      "items": [
+        {"url": "https://...", "status": "skipped", "reason": "已抓过 (匹配文件: ...)", "elapsed_ms": 7},
+        {"url": "https://...", "status": "success", "file": "...md", "json_file": "...json", "elapsed_ms": 7844}
+      ]
+    }
+  ]
+}
+```
+
+**消费示例**（jq）：
+```bash
+# 看最近一次批次的失败项
+jq '.batches[-1].items[] | select(.status == "failed")' batch-log.json
+
+# 累计总成功/失败
+jq '[.batches[].success] | add' batch-log.json
+
+# 找所有批次的 skipped 项
+jq '.batches[].items[] | select(.status == "skipped") | .reason' batch-log.json
 ```
 
 ## 配置项（config.json）

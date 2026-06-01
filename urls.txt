@@ -1,0 +1,25 @@
+# douyin-link-to-obsidian 批量测试
+# 2026-06-01 韬定律 + 华为产业链专题
+# 注释以 # 开头，空行会被忽略
+
+# 已抓过（用于测试去重）
+https://v.douyin.com/2vX7spOC_sg/
+
+# 已知有效的几条
+https://www.douyin.com/shipin/7644729891430336512
+https://www.douyin.com/shipin/7644777169788438554
+https://www.douyin.com/shipin/7644750321394550824
+https://www.douyin.com/video/7509849971294833947?source=Googlebot-sdc
+
+# 5 条新 URL
+https://www.douyin.com/zhuanti/7644757825889077263
+https://www.douyin.com/shipin/7644758650900400178
+https://www.douyin.com/shipin/7644732452702783523
+https://www.douyin.com/shipin/7644730697315321919
+https://www.douyin.com/shipin/7644750321394550824
+
+# 1 条无效 URL（不是 douyin.com）
+https://www.youtube.com/watch?v=test
+
+# 1 条空行 + 注释（应被忽略）
+# https://www.douyin.com/shipin/7644000000000000000
