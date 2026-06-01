@@ -358,18 +358,52 @@ async function scrapeDouyinPage(page, url) {
 // ============================================================
 // Markdown 渲染
 // ============================================================
+function yamlEscape(str) {
+  // YAML 字符串安全化：含特殊字符（: # & * ? | > ! % @ ` [ ] { } , 等）时用双引号包裹
+  // 内部双引号转义
+  if (str === null || str === undefined) return '""';
+  const s = String(str);
+  // 纯安全（只含字母数字中文空白 - _）可不引号
+  if (/^[\w\u4e00-\u9fa5\-_.\s]+$/.test(s)) return s;
+  return `"${s.replace(/"/g, '\\"').replace(/\n/g, ' ').slice(0, 200)}"`;
+}
+
 function buildMarkdown(data) {
   const now = new Date();
+  const symbols = extractMentionedSymbols(data);
+
+  // tags 构造：基础 tag + 股票 tag（去重）
+  const tags = new Set(['douyin', '抖音']);
+  for (const s of symbols) {
+    if (s.kind === 'a_stock_code') {
+      tags.add(`stock/${s.value}`);  // 股票代码 tag，Dataview 友好
+    } else if (s.kind === 'a_stock_name') {
+      tags.add(`stock/${s.value}`);
+    } else if (s.kind === 'hk_stock_code') {
+      tags.add(`stock/${s.value}`);
+    }
+  }
+  const tagsYaml = Array.from(tags).map(t => yamlEscape(t)).join(', ');
+
+  // mentioned_symbols YAML 数组
+  const symbolsYaml = symbols.length
+    ? '\n' + symbols.map(s =>
+        `  - kind: ${yamlEscape(s.kind)}\n    value: ${yamlEscape(s.value)}`
+      ).join('\n')
+    : ' []';
+
   const frontmatter = [
     '---',
-    `title: "${(data.title || '未知标题').replace(/"/g, '\\"')}"`,
-    `author: "${(data.author || '未知').replace(/"/g, '\\"')}"`,
-    `original_url: "${data.inputUrl || data.finalUrl || ''}"`,
-    `final_url: "${data.finalUrl || data.inputUrl || ''}"`,
-    `publish_time: "${data.publishTime || '未知'}"`,
-    `video_id: "${data.videoId || ''}"`,
-    `scraped_at: "${now.toISOString()}"`,
-    `tags: [抖音, douyin]`,
+    `title: ${yamlEscape(data.title || '未知标题')}`,
+    `author: ${yamlEscape(data.author || '未知')}`,
+    `source: ${yamlEscape('douyin')}`,
+    `source_url: ${yamlEscape(data.inputUrl || data.finalUrl || '')}`,
+    `final_url: ${yamlEscape(data.finalUrl || data.inputUrl || '')}`,
+    `published_at: ${yamlEscape(data.publishTime || '')}`,
+    `video_id: ${yamlEscape(data.videoId || '')}`,
+    `scraped_at: ${yamlEscape(now.toISOString())}`,
+    `mentioned_symbols:${symbolsYaml}`,
+    `tags: [${tagsYaml}]`,
     '---',
     '',
   ].join('\n');

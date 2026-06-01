@@ -1,6 +1,6 @@
 # douyin-link-to-obsidian
 
-> **当前能力边界**（v0.3 标签对应 `v0.3-json-output`）
+> **当前能力边界**（v0.4 标签对应 `v0.4-obsidian-polish`）
 >
 > | 项 | 状态 |
 > |---|---|
@@ -13,8 +13,10 @@
 > | 评论 | ✅ 已支持（默认 10 条，可配置） |
 > | 抓取日志 | ✅ 已支持（写入 md 文件 + 控制台输出） |
 > | Markdown 输出 | ✅ 已支持（`.md` 文件含 frontmatter + 元数据表 + 章节/评论表格） |
-> | **结构化 JSON 输出** | ✅ 已支持（v0.3 新增，`.json` 与 `.md` 同名同目录，14 个字段） |
-> | **股票提及提取** | ✅ 已支持（v0.3 新增，纯正则+静态词典，不调 LLM） |
+> | 结构化 JSON 输出 | ✅ 已支持（v0.3 新增，`.json` 与 `.md` 同名同目录，14 个字段） |
+> | 股票提及提取 | ✅ 已支持（v0.3 新增，纯正则+静态词典，不调 LLM） |
+> | **Obsidian YAML frontmatter** | ✅ 已支持（v0.4 新增，10 字段，YAML 合法） |
+> | **Dataview 检索友好** | ✅ 已支持（v0.4 新增，按 author / source / tags / mentioned_symbols 检索） |
 > | 字幕 | ❌ 暂不支持 |
 > | 博主主页跟踪 | ❌ 暂不支持 |
 > | 批量抓取 | ❌ 暂不支持 |
@@ -134,6 +136,77 @@ D:\ObsidianVault\Douyin\2026-06-01-机构一手调研（福总）-韬定律刷�
 1. 静态词典匹配（`KNOWN_A_STOCKS` 数组里的中文股票名）
 2. A 股代码正则 `\b[036]\d{5}\b`（以 0/3/6 开头避免误匹）
 3. 港股代码正则 `\b\d{4,5}\.HK\b`
+
+## Markdown Frontmatter 字段（v0.4）
+
+每个 `.md` 文件顶部带 YAML frontmatter（10 字段），Obsidian 原生识别 + Dataview 可直接查询：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `title` | string | 视频标题 |
+| `author` | string | 视频作者 |
+| `source` | string | 固定 `"douyin"`（来源平台） |
+| `source_url` | string | 用户输入的原始 URL（短链） |
+| `final_url` | string | 跳转后的 URL（长链） |
+| `published_at` | string | 发布时间（抖音原文本格式） |
+| `video_id` | string | 抖音视频 ID |
+| `scraped_at` | string (ISO) | 抓取完成时间 |
+| `mentioned_symbols` | object[] | 提及的股票 `[{kind, value}]` |
+| `tags` | string[] | 标签（`douyin`, `抖音` + `stock/股票名` 形式） |
+
+**Dataview 查询示例**：
+
+```dataview
+TABLE author, published_at, length(tags) - 2 AS "提及股票数"
+FROM "Douyin"
+WHERE source = "douyin"
+SORT published_at DESC
+```
+
+```dataview
+LIST
+FROM "Douyin"
+WHERE contains(tags, "stock/长电科技")
+```
+
+```dataview
+TABLE author, published_at
+FROM "Douyin"
+WHERE mentioned_symbols[*].value = "中芯国际"
+FLATTEN mentioned_symbols
+```
+
+**示例 frontmatter**（实际抓取输出）：
+```yaml
+---
+title: 韬定律刷屏之后，华为的突破真相与冷静思考#韬定律#半导体#芯片#国产算力#科创板
+author: 机构一手调研（福总）
+source: douyin
+source_url: https://v.douyin.com/2vX7spOC_sg/
+final_url: https://www.douyin.com/video/7644012348403992037
+published_at: 2026-05-26 09:51
+video_id: "7644012348403992037"
+scraped_at: 2026-06-01T08:05:43.551Z
+mentioned_symbols:
+  - kind: a_stock_name
+    value: 长电科技
+  - kind: a_stock_name
+    value: 深科技
+  - kind: a_stock_name
+    value: 太极实业
+  - kind: a_stock_name
+    value: 利通电子
+  - kind: a_stock_name
+    value: 盛合晶微
+  - kind: a_stock_name
+    value: 中芯国际
+  - kind: a_stock_name
+    value: 华为
+  - kind: a_stock_name
+    value: 昇腾
+tags: [douyin, 抖音, stock/长电科技, stock/深科技, stock/太极实业, stock/利通电子, stock/盛合晶微, stock/中芯国际, stock/华为, stock/昇腾]
+---
+```
 
 ## 配置项（config.json）
 
