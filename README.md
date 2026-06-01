@@ -1,14 +1,15 @@
 # douyin-link-to-obsidian
 
-> **当前能力边界**（v0.1 标签对应 `ef24ae7`）
+> **当前能力边界**（v0.2 标签对应 `v0.2-stability`）
 >
 > | 项 | 状态 |
 > |---|---|
-> | 单条抖音 URL 抓取 | ✅ 已支持（短链 `v.douyin.com/xxx` + 长链 `www.douyin.com/video/数字ID`） |
+> | 单条抖音 URL 抓取 | ✅ 已支持（短链 `v.douyin.com/xxx` + 长链 `www.douyin.com/video/数字ID` + `www.douyin.com/shipin/数字ID`） |
+> | 跳转后 URL 记录 | ✅ 已支持（`final_url` 字段单独存 frontmatter） |
 > | 标题 | ✅ 已支持 |
 > | 作者 | ✅ 已支持 |
-> | 发布时间 | ⚠️ 仅 `/video/` 路径支持；`/shipin/` 路径存在已知问题（见 #7） |
-> | 章节 / 文案 | ⚠️ 章节已支持但非稳态（懒加载，详见 #4） |
+> | 发布时间 | ✅ 已支持（`/video/` 用 `data-e2e`；`/shipin/` 用全文正则兜底） |
+> | 章节 / 文案 | ✅ 章节已支持稳定（自适应等待连续 2 次相同章节数） |
 > | 评论 | ✅ 已支持（默认 10 条，可配置） |
 > | 抓取日志 | ✅ 已支持（写入 md 文件 + 控制台输出） |
 > | 字幕 | ❌ 暂不支持 |
@@ -172,10 +173,11 @@ D:\ObsidianVault\Douyin\2026-06-01-机构一手调研（福总）-韬定律刷�
 1. **抖音 PC 版 DOM 不稳定**：class 名是 hash 化的（`B7xjsf10` / `pZwkOJ8K` 这种），未来抖音改版可能失效。优先用 `data-e2e` 属性，class 只作 fallback。
 2. **作者信息位置诡异**：抖音 PC 版把"作者卡片"放在 `data-e2e="related-video"` 节点里，名字旁边还紧跟推荐视频列表——DOM 抓取时容易误抓推荐区。**修复后**用"祖先节点含 '粉丝' + 数字"特征定位（不依赖具体文本/class 名）。
 3. **评论懒加载**：必须 scroll 到页面底部才触发评论 DOM 渲染。**修复后**用"含 '回复' + '分享' + 数字赞数"的最小重复 DOM 块定位，并用祖先-后代表达式 dedup 掉外层容器。
-4. **章节列表**识别靠 `HH:MM` 正则——如果抖音改用按钮形式（点开才显示），这个会失效。**已知非稳态**：同一 URL 多次跑章节数 1/7/25 浮动，根因是章节是懒加载、`wait_after_navigate_ms`（默认 3000ms）不够。等时机成熟扩展等待时间。
-5. **短链 302**：抖音短链 `v.douyin.com/xxx` 会 302 到 `www.douyin.com/video/数字ID`，自动 follow 即可。
+4. ~~**章节列表**识别靠 `HH:MM` 正则——如果抖音改用按钮形式（点开才显示），这个会失效。~~ **v0.2 已修复**：改为"自适应稳定等待"，每 500ms 探测一次，连续 2 次相同章节数即返回（最多 10 秒）。章节数现在 100% 可复现。
+5. **短链 302**：抖音短链 `v.douyin.com/xxx` 会 302 到 `www.douyin.com/video/数字ID`，自动 follow 即可。**v0.2 已记录**：`original_url`（用户输入） + `final_url`（跳转后）分别写入 frontmatter 和元数据表。
 6. **9292 端口不能和正常 Edge 共享**：必须用独立 `--user-data-dir`，否则 `Start-Process` 会拉不起新进程（端口被占用）。
-7. **`/shipin/` 类型 URL 的发布时间抓不到**：当前实现只支持 `/video/` 路径下的 `[data-e2e="detail-video-publish-time"]` 元素。`/shipin/` 是抖音另一种重定向后的 URL 形式，发布时间用不同的 DOM 结构展示，需要单独写 selector。已知未修复。
+7. ~~**`/shipin/` 类型 URL 的发布时间抓不到**~~ **v0.2 已修复**：`/video/` 用 `data-e2e="detail-video-publish-time"`，`/shipin/` 兜底用全文正则 `发布时间[：:]\s*\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}`。两种 URL 形式现在都能抓到发布时间。
+8. **重试策略范围有限**：v0.2 失败重试只对**网络/CDP/导航类错误**生效，selector 失败不重试（重试 selector 失败没有意义）。如果遇到 selector 失效，是代码 bug，需要修 selector 而不是重试。
 
 ## 调试技巧
 

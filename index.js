@@ -111,11 +111,57 @@ async function connectBrowser() {
 }
 
 // ============================================================
+// 章节稳定等待
+// ============================================================
+async function waitForChapterStability(page) {
+  const POLL_MS = 500;
+  const MAX_WAIT_MS = 10000;
+  const STABLE_ROUNDS = 2;  // 连续 N 次相同章节数才算稳定
+  const start = Date.now();
+  let lastCount = -1;
+  let stableHits = 0;
+  let lastItems = [];
+
+  while (Date.now() - start < MAX_WAIT_MS) {
+    const items = await page.evaluate(() => {
+      const found = Array.from(document.querySelectorAll('li, div, span, p'))
+        .map(e => (e.innerText || '').trim())
+        .filter(t => /^\d{2}:\d{2}\s+\S/.test(t))
+        .map(t => t.split('\n').slice(0, 2).join(' | '));
+      // dedup
+      return found.filter((v, i, a) => a.indexOf(v) === i).slice(0, 25);
+    });
+
+    if (items.length === lastCount && items.length > 0) {
+      stableHits++;
+      if (stableHits >= STABLE_ROUNDS) {
+        return { items, elapsedMs: Date.now() - start };
+      }
+    } else {
+      stableHits = 0;
+      lastCount = items.length;
+      lastItems = items;
+    }
+
+    await page.waitForTimeout(POLL_MS);
+  }
+
+  // 超时返回当前抓到的（可能不全，但比没有强）
+  return { items: lastItems, elapsedMs: Date.now() - start };
+}
+
+// ============================================================
 // 抓取核心（用实战验证的 DOM selector）
 // ============================================================
 async function scrapeDouyinPage(page, url) {
   log('INFO', `导航: ${url}`);
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: GOTO_TIMEOUT_MS });
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: GOTO_TIMEOUT_MS });
+  } catch (e) {
+    // 网络/timeout 类错误 → 抛给上层 retry 包装
+    fail('页面导航失败', e.message);
+    throw e;
+  }
   await page.waitForTimeout(WAIT_AFTER_NAV_MS);
 
   // --- 主视频元数据（data-e2e="detail-video-info" 是真视频容器）---
@@ -129,7 +175,13 @@ async function scrapeDouyinPage(page, url) {
         || info.innerText.split('\n')[0]?.trim()
         || null;
       const timeEl = info.querySelector('[data-e2e="detail-video-publish-time"]');
-      if (timeEl) out.publishTime = timeEl.innerText.replace(/^发布时间：/, '').trim();
+    if (timeEl) {
+      out.publishTime = timeEl.innerText.replace(/^发布时间[：:]/, '').trim();
+    } else {
+      // /shipin/ 路径下可能没有 data-e2e，兜底用全文正则
+      const m = info.innerText.match(/发布时间[：:]\s*(\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2})/);
+      if (m) out.publishTime = m[1];
+    }
       // 数字（11.0万 / 8815 / 3.6万 / 3.1万）
       const nums = info.innerText.match(/\d+(?:\.\d+)?[万亿]?/g) || [];
       // 顺序：点赞 评论 收藏 分享（不一定都对，按位置猜）
@@ -191,16 +243,12 @@ async function scrapeDouyinPage(page, url) {
     log('WARN', '发布时间未抓到');
   }
 
-  // --- 章节列表（HH:MM 模式）---
-  const chapters = await page.evaluate(() => {
-    const items = Array.from(document.querySelectorAll('li, div, span, p'))
-      .map(e => (e.innerText || '').trim())
-      .filter(t => /^\d{2}:\d{2}\s+\S/.test(t))
-      .map(t => t.split('\n').slice(0, 2).join(' | '))
-      .filter((v, i, a) => a.indexOf(v) === i);
-    return items.slice(0, 25);
-  });
-  log('INFO', `章节: ${chapters.length} 条`);
+  // --- 章节列表（HH:MM 模式，自适应等待稳定）---
+  // 抖音 PC 端章节是懒加载的，固定 wait_for_timeout 不够稳
+  // 策略：每 500ms 探测一次章节数，连续 2 次相同则算稳定
+  const chaptersResult = await waitForChapterStability(page);
+  const chapters = chaptersResult.items;
+  log('INFO', `章节: ${chapters.length} 条（稳定用时 ${chaptersResult.elapsedMs}ms）`);
 
   // --- 评论（需 scroll 触发懒加载）---
   let comments = [];
@@ -298,7 +346,8 @@ async function scrapeDouyinPage(page, url) {
     author: meta.author,
     publishTime: meta.publishTime,
     videoId: meta.videoId,
-    url: meta.url,
+    inputUrl: url,         // 用户输入的 URL（短链）
+    finalUrl: meta.url,    // 跳转后的 URL（带 video_id 的长链）
     stats: meta.stats,
     chapters,
     comments,
@@ -315,7 +364,8 @@ function buildMarkdown(data) {
     '---',
     `title: "${(data.title || '未知标题').replace(/"/g, '\\"')}"`,
     `author: "${(data.author || '未知').replace(/"/g, '\\"')}"`,
-    `original_url: "${data.url || ''}"`,
+    `original_url: "${data.inputUrl || data.finalUrl || ''}"`,
+    `final_url: "${data.finalUrl || data.inputUrl || ''}"`,
     `publish_time: "${data.publishTime || '未知'}"`,
     `video_id: "${data.videoId || ''}"`,
     `scraped_at: "${now.toISOString()}"`,
@@ -336,7 +386,12 @@ function buildMarkdown(data) {
   if (data.stats?.raw?.length) {
     blocks.push(`| 互动数据（原始） | ${data.stats.raw.join(' / ')} |`);
   }
-  blocks.push(`| 原始链接 | ${data.url} |`);
+  if (data.inputUrl && data.finalUrl && data.inputUrl !== data.finalUrl) {
+    blocks.push(`| 原始链接（用户输入） | ${data.inputUrl} |`);
+    blocks.push(`| 跳转后链接 | ${data.finalUrl} |`);
+  } else {
+    blocks.push(`| 原始链接 | ${data.inputUrl || data.finalUrl || ''} |`);
+  }
   blocks.push('');
 
   // 章节
@@ -367,7 +422,7 @@ function buildMarkdown(data) {
 
   // 抓取日志（透明化失败点）
   blocks.push('## 抓取日志', '');
-  blocks.push('```', `[INFO] 导航: ${data.url}`, `[INFO] 章节: ${data.chapters.length} 条`, `[INFO] 评论: ${data.comments.length} 条`, `[INFO] 字幕: 未获取`, `[INFO] 抓取完成: ${now.toISOString()}`, '```', '');
+  blocks.push('```', `[INFO] 导航: ${data.finalUrl || data.inputUrl}`, `[INFO] 章节: ${data.chapters.length} 条`, `[INFO] 评论: ${data.comments.length} 条`, `[INFO] 字幕: 未获取`, `[INFO] 抓取完成: ${now.toISOString()}`, '```', '');
 
   return frontmatter + blocks.join('\n');
 }
@@ -405,8 +460,28 @@ async function main() {
     const context = await browser.newContext();
     page = await context.newPage();
 
-    // 抓取
-    data = await scrapeDouyinPage(page, url);
+    // 抓取（带重试：网络/CDP 错误重试 1 次）
+    const RETRY_DELAY_MS = 1000;
+    let attempts = 0;
+    const maxAttempts = 2;
+    let lastError = null;
+    while (attempts < maxAttempts) {
+      attempts++;
+      try {
+        data = await scrapeDouyinPage(page, url);
+        if (attempts > 1) log('INFO', `第 ${attempts} 次重试成功`);
+        break;
+      } catch (e) {
+        lastError = e;
+        if (attempts < maxAttempts) {
+          log('WARN', `第 ${attempts} 次抓取失败，${RETRY_DELAY_MS}ms 后重试: ${e.message}`);
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+        }
+      }
+    }
+    if (!data) {
+      throw lastError || new Error('抓取失败且无更多错误信息');
+    }
 
     // 验收检查：标题/作者/文案 至少一项
     const hit = [data.title, data.author, data.publishTime].filter(Boolean).length;
