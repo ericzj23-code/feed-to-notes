@@ -1,0 +1,15 @@
+{
+  "obsidian": {
+    "output_dir": "/mnt/d/ObsidianVault/Douyin"
+  },
+  "browser": {
+    "cdp_url": "http://127.0.0.1:9222",
+    "goto_timeout_ms": 30000,
+    "wait_after_navigate_ms": 3000,
+    "wait_after_scroll_ms": 2000
+  },
+  "scrape": {
+    "fetch_comments": true,
+    "comment_max_count": 10
+  }
+}
