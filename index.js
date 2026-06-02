@@ -96,10 +96,13 @@ function isValidDouyinUrl(url) {
 }
 
 function buildFilename(data) {
-  const today = new Date().toISOString().slice(0, 10);
+  // v0.10 改：优先用 publishedAt 真实发布日期，没有才 fallback 到抓取日
+  const pub = data.publishTime && /^\d{4}-\d{2}-\d{2}/.test(data.publishTime)
+    ? data.publishTime.slice(0, 10)
+    : new Date().toISOString().slice(0, 10);
   const author = sanitizeFilename(data.author);
   const title = sanitizeFilename(data.title);
-  return `${today}-${author}-${title}.md`;
+  return `${pub}-${author}-${title}.md`;
 }
 
 // ============================================================
@@ -381,10 +384,70 @@ async function scrapeDouyinPage(page, url) {
     log('INFO', '配置 fetch_comments=false，跳过评论抓取');
   }
 
-  // --- 字幕：本次未抓取（视频默认静音，字幕面板未自动展开）---
-  // 文档明示 "字幕未获取" 时不报错中断
-  const subtitle = null;
-  log('INFO', '字幕：未获取（视频静音，字幕面板需手动展开）');
+  // --- 字幕：尝试点开 .xgplayer-texttrack 按钮，选第一条 STT 轨道 ---
+  // 抖音 PC 西瓜播放器（xgplayer）默认静音，字幕面板需手动展开
+  // 路径：点击 .xgplayer-texttrack → 在弹出菜单中选 data-type ≠ "text-close" 的第一个 <li> → 等 2-3s 让 STT 加载 → 抓 .xg-text-track-content / 类似 DOM
+  let subtitle = null;
+  try {
+    subtitle = await page.evaluate(async () => {
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+      // 1) 找到字幕按钮
+      const btn = document.querySelector('.xgplayer-texttrack');
+      if (!btn) return { ok: false, reason: '字幕按钮未找到' };
+
+      // 2) 点击展开菜单（用真实 mouse 事件序列触发 web component 内部 handler）
+      const rect = btn.getBoundingClientRect();
+      // xg-icon 自定义标签 getBoundingClientRect 可能 0，跳过坐标点击
+      ['mousedown', 'mouseup', 'click'].forEach(t => {
+        btn.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+      });
+      await sleep(500);
+
+      // 3) 看菜单里有没有非"不开启"的轨道
+      const items = Array.from(document.querySelectorAll('.xgplayer-texttrack .option-item'));
+      if (items.length === 0) {
+        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); // 收起菜单
+        return { ok: false, reason: '字幕菜单为空' };
+      }
+      const realItem = items.find(i => i.getAttribute('data-type') !== 'text-close');
+      if (!realItem) {
+        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        return { ok: false, reason: '只有"不开启"项（视频无字幕轨道）' };
+      }
+
+      // 4) 点击选字幕轨道
+      realItem.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      await sleep(2500);  // 等 STT 字幕时间戳加载
+
+      // 5) 抓字幕 DOM — xgplayer 字幕通常渲染在 .xgplayer-texttrack-content 或 video 容器下的 .text-block
+      const textBlocks = Array.from(document.querySelectorAll(
+        '.xgplayer-texttrack-content, .text-block, [class*="text-track"] [class*="content"], [class*="subtitle"] [class*="content"]'
+      ));
+      const lines = textBlocks
+        .map(b => (b.innerText || '').trim())
+        .filter(l => l.length > 0)
+        // 去重保持顺序
+        .filter((l, i, arr) => arr.indexOf(l) === i);
+
+      if (lines.length === 0) {
+        return { ok: false, reason: '点了字幕选项但未抓到字幕 DOM' };
+      }
+
+      return { ok: true, text: lines.join('\n'), count: lines.length };
+    });
+  } catch (e) {
+    fail('字幕抓取异常', e.message);
+    subtitle = { ok: false, reason: 'exception: ' + e.message };
+  }
+
+  if (subtitle && subtitle.ok) {
+    log('INFO', `字幕: ${subtitle.count} 条（已展开）`);
+  } else {
+    const reason = (subtitle && subtitle.reason) || '未知失败';
+    log('WARN', `字幕未获取（${reason}）`);
+    subtitle = null;
+  }
 
   return {
     title: meta.title,
@@ -482,8 +545,12 @@ function buildMarkdown(data) {
 
   // 字幕
   blocks.push('## 字幕 / 可见文本', '');
-  blocks.push('字幕未获取（视频默认静音，字幕面板未自动展开）', '');
-  blocks.push('> 历史经验：可通过点击播放器右下角"字幕"按钮触发，但需要手动操作。', '');
+  if (data.subtitle) {
+    blocks.push(data.subtitle, '');
+  } else {
+    blocks.push('字幕未获取（视频无 STT 字幕轨道，或 Edge 客户端未提供）', '');
+    blocks.push('> 已尝试自动点开 .xgplayer-texttrack 按钮展开字幕面板。', '');
+  }
   blocks.push('');
 
   // 评论
@@ -536,7 +603,7 @@ function buildMarkdown(data) {
 
   // 抓取日志（透明化失败点）
   blocks.push('## 抓取日志', '');
-  blocks.push('```', `[INFO] 导航: ${data.finalUrl || data.inputUrl}`, `[INFO] 章节: ${data.chapters.length} 条`, `[INFO] 评论: ${data.comments.length} 条`, `[INFO] 字幕: 未获取`, `[INFO] 抓取完成: ${now.toISOString()}`, '```', '');
+  blocks.push('```', `[INFO] 导航: ${data.finalUrl || data.inputUrl}`, `[INFO] 章节: ${data.chapters.length} 条`, `[INFO] 评论: ${data.comments.length} 条`, `[INFO] 字幕: ${data.subtitle ? '已获取' : '未获取'}`, `[INFO] 抓取完成: ${now.toISOString()}`, '```', '');
 
   return frontmatter + blocks.join('\n');
 }
@@ -810,15 +877,28 @@ function parseUrlsFile(filepath) {
 }
 
 // ============================================================
-// 已抓过链接扫描（看 OUTPUT_DIR 里 .json 的 source_url/final_url）
-// ============================================================
+// 已抓过链接扫描（看 OUTPUT_DIR 下所有子目录里的 .json 的 source_url/final_url）
+// v0.10 改：递归扫子目录（之前只看顶层，新版按作者分目录后必须递归）
 function scanAlreadyScraped() {
   const seen = new Map();  // url -> filepath
   if (!fs.existsSync(OUTPUT_DIR)) return seen;
 
-  const files = fs.readdirSync(OUTPUT_DIR).filter(f => f.endsWith('.json'));
-  for (const f of files) {
-    const full = path.join(OUTPUT_DIR, f);
+  // 递归收集所有 .json：OUTPUT_DIR 下所有 .json + 直属子目录下的 .json
+  const files = [];
+  for (const entry of fs.readdirSync(OUTPUT_DIR, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith('.json')) {
+      files.push(path.join(OUTPUT_DIR, entry.name));
+    } else if (entry.isDirectory()) {
+      const sub = path.join(OUTPUT_DIR, entry.name);
+      try {
+        for (const sf of fs.readdirSync(sub)) {
+          if (sf.endsWith('.json')) files.push(path.join(sub, sf));
+        }
+      } catch (e) { /* 跳过不可读目录 */ }
+    }
+  }
+
+  for (const full of files) {
     try {
       const obj = JSON.parse(fs.readFileSync(full, 'utf8'));
       if (obj.source_url) seen.set(obj.source_url, full);
@@ -895,14 +975,17 @@ async function processOneUrl(url, browser, sharedContext, options = {}) {
       log('WARN', '继续生成文件（标注"未知"）以便人工补全');
     }
 
-    // 写文件
+    // 写文件 — 按作者分子目录（v0.10 新增）
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    const authorSubdir = sanitizeFilename(data.author) || '_untitled';
+    const authorDir = path.join(OUTPUT_DIR, authorSubdir);
+    if (!fs.existsSync(authorDir)) fs.mkdirSync(authorDir, { recursive: true });
     const filename = buildFilename(data);
-    let filepath = path.join(OUTPUT_DIR, filename);
+    let filepath = path.join(authorDir, filename);
 
     if (fs.existsSync(filepath)) {
       const ts = new Date().toISOString().slice(11, 19).replace(/:/g, '');
-      filepath = path.join(OUTPUT_DIR, `${path.parse(filename).name}-${ts}${path.extname(filename)}`);
+      filepath = path.join(authorDir, `${path.parse(filename).name}-${ts}${path.extname(filename)}`);
     }
 
     fs.writeFileSync(filepath, buildMarkdown(data), 'utf8');
