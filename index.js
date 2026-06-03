@@ -877,11 +877,15 @@ function parseUrlsFile(filepath) {
 }
 
 // ============================================================
-// 已抓过链接扫描（看 OUTPUT_DIR 下所有子目录里的 .json 的 source_url/final_url）
+// 已抓过链接扫描（看 OUTPUT_DIR 下所有子目录里的 .json 的 source_url/final_url/video_id）
 // v0.10 改：递归扫子目录（之前只看顶层，新版按作者分目录后必须递归）
+// v0.11 改：返回 { urls, videoIds } 双索引
+//   - urls：source_url + final_url → filepath（快路径,挡完全相同输入）
+//   - videoIds：raw_payload.video_id → filepath（兜底,挡"换链接形式的同一视频"）
 function scanAlreadyScraped() {
-  const seen = new Map();  // url -> filepath
-  if (!fs.existsSync(OUTPUT_DIR)) return seen;
+  const urls = new Map();      // url -> filepath
+  const videoIds = new Map();  // video_id -> filepath
+  if (!fs.existsSync(OUTPUT_DIR)) return { urls, videoIds };
 
   // 递归收集所有 .json：OUTPUT_DIR 下所有 .json + 直属子目录下的 .json
   const files = [];
@@ -901,19 +905,32 @@ function scanAlreadyScraped() {
   for (const full of files) {
     try {
       const obj = JSON.parse(fs.readFileSync(full, 'utf8'));
-      if (obj.source_url) seen.set(obj.source_url, full);
-      if (obj.final_url && obj.final_url !== obj.source_url) seen.set(obj.final_url, full);
+      if (obj.source_url) urls.set(obj.source_url, full);
+      if (obj.final_url && obj.final_url !== obj.source_url) urls.set(obj.final_url, full);
+      const vid = obj.raw_payload && obj.raw_payload.video_id;
+      if (vid) videoIds.set(String(vid), full);
     } catch (e) {
       // JSON 损坏不影响扫描
     }
   }
-  return seen;
+  return { urls, videoIds };
+}
+
+// 把刚抓完的一条结果合并进 dedup 索引（防止同一 urls.txt 内部重复）
+// 增量更新：source_url / final_url / video_id 都补进去,后续 URL 命中走快路径
+function indexScrapedResult(index, data, filepath) {
+  if (data.inputUrl) index.urls.set(data.inputUrl, filepath);
+  if (data.finalUrl && data.finalUrl !== data.inputUrl) index.urls.set(data.finalUrl, filepath);
+  if (data.videoId) index.videoIds.set(String(data.videoId), filepath);
 }
 
 // ============================================================
 // 单条 URL 处理（被 main / batch 复用）
+// v0.11 改：dedupIndex 由外层（runBatch / runSingle）扫一次传入,本函数不再自扫
+//   - dedupIndex.urls 命中 → A 路径 skip（快路径,0 网络）
+//   - scrape 拿到 videoId 后查 dedupIndex.videoIds 命中 → B 路径 skip（白跑一次 scrape）
 // ============================================================
-async function processOneUrl(url, browser, sharedContext, options = {}) {
+async function processOneUrl(url, browser, sharedContext, dedupIndex, options = {}) {
   const { isBatch = false } = options;
   const startedAt = Date.now();
   const result = {
@@ -925,11 +942,10 @@ async function processOneUrl(url, browser, sharedContext, options = {}) {
     elapsed_ms: 0,
   };
 
-  // 已抓过检查
-  const alreadyScraped = scanAlreadyScraped();
-  if (alreadyScraped.has(url)) {
+  // 已抓过检查（A 路径：URL 字符串命中,快路径）
+  if (dedupIndex.urls.has(url)) {
     result.status = 'skipped';
-    result.reason = `已抓过 (匹配文件: ${path.basename(alreadyScraped.get(url))})`;
+    result.reason = `已抓过 (URL 命中: ${path.basename(dedupIndex.urls.get(url))})`;
     result.elapsed_ms = Date.now() - startedAt;
     log('INFO', `跳过（已抓过）: ${url}`);
     return result;
@@ -975,6 +991,17 @@ async function processOneUrl(url, browser, sharedContext, options = {}) {
       log('WARN', '继续生成文件（标注"未知"）以便人工补全');
     }
 
+    // B 路径：scrape 拿到 videoId 后再查 video_ids 索引,挡"换链接形式的同一视频"
+    // 代价:这条 URL 白跑了一次 scrape,但 B 不是主路径,可接受
+    // elapsed_ms 照实记录（不归零）,承认"白跑了 X 秒"才是诚实数据
+    if (data.videoId && dedupIndex.videoIds.has(String(data.videoId))) {
+      result.status = 'skipped';
+      result.reason = `已抓过 (video_id 命中: ${path.basename(dedupIndex.videoIds.get(String(data.videoId)))})`;
+      result.elapsed_ms = Date.now() - startedAt;
+      log('INFO', `跳过（video_id 已存在）: ${url} (video_id=${data.videoId})`);
+      return result;
+    }
+
     // 写文件 — 按作者分子目录（v0.10 新增）
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     const authorSubdir = sanitizeFilename(data.author) || '_untitled';
@@ -994,6 +1021,9 @@ async function processOneUrl(url, browser, sharedContext, options = {}) {
     const jsonFilepath = filepath.replace(/\.md$/, '.json');
     fs.writeFileSync(jsonFilepath, buildJson(data), 'utf8');
     log('SUCCESS', `已保存: ${jsonFilepath}`);
+
+    // 增量更新 dedup 索引（防止同一 urls.txt 内后续行重复 scrape）
+    indexScrapedResult(dedupIndex, data, jsonFilepath);
 
     // v0.6: AI 总结层（在原始内容已写盘后追加，不影响主流程）
     // 失败时不重写文件，原始内容保留；成功时把 summary 注入 data 并重写文件
@@ -1057,7 +1087,9 @@ async function runSingle(url) {
   try {
     browser = await connectBrowser();
     const context = await browser.newContext();
-    const result = await processOneUrl(url, browser, context, { isBatch: false });
+    // v0.11 改：单条也走 dedup 索引（保持签名一致;空库起步,本条命中就 skip）
+    const dedupIndex = scanAlreadyScraped();
+    const result = await processOneUrl(url, browser, context, dedupIndex, { isBatch: false });
     return result;
   } catch (e) {
     log('ERROR', `主流程异常: ${e.message}`);
@@ -1097,6 +1129,11 @@ async function runBatch(urlsFile) {
   const items = [];
   let browser, context;
 
+  // v0.11 改：dedup 索引外提（一次扫盘 + 一次 parse,O(M) 摊到整个 batch）
+  // 原 O(N×M) 重扫是批量性能咬人的根因（每条 URL 都重扫所有 .json）
+  const dedupIndex = scanAlreadyScraped();
+  log('INFO', `dedup 索引: ${dedupIndex.urls.size} 个 URL / ${dedupIndex.videoIds.size} 个 video_id`);
+
   try {
     browser = await connectBrowser();
     context = await browser.newContext();
@@ -1104,7 +1141,7 @@ async function runBatch(urlsFile) {
     for (let i = 0; i < urls.length; i++) {
       const url = urls[i];
       console.log(`\n[${i + 1}/${urls.length}] ${url}`);
-      const result = await processOneUrl(url, browser, context, { isBatch: true });
+      const result = await processOneUrl(url, browser, context, dedupIndex, { isBatch: true });
       items.push(result);
       // 条目之间间隔 1s（防止抖音反爬）
       if (i < urls.length - 1) {
