@@ -1,13 +1,13 @@
 {
-  "name": "douyin-link-to-obsidian",
+  "name": "feed-to-notes",
   "version": "1.0.0",
-  "description": "",
+  "description": "Any-platform link → Obsidian notes. Currently supports Douyin. Future: Bilibili / Xiaohongshu / YouTube.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": ["obsidian", "douyin", "knowledge-management", "pkm"],
+  "author": "ericzj23-code",
   "license": "ISC",
   "dependencies": {
     "playwright": "^1.60.0"

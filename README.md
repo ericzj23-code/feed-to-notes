@@ -1,6 +1,8 @@
-# douyin-link-to-obsidian
+# feed-to-notes
 
-> **当前能力边界**（v0.9 标签对应 `v0.9-creator-tracking`）
+> **项目前身**：`douyin-link-to-obsidian`（v0.1 → v0.10）。**v0.11 起**更名为 `feed-to-notes`，架构升级为**任意平台 → 笔记**通用管道；抖音作为第一个支持的平台继续保留。
+>
+> **当前能力边界**（v0.11 · 多平台框架）
 >
 > | 项 | 状态 |
 > |---|---|
@@ -36,7 +38,7 @@
 ## 文件结构
 
 ```
-douyin-link-to-obsidian/
+feed-to-notes/
 ├── index.js         # 主脚本
 ├── config.json      # 配置（路径/CDP/评论条数）
 ├── package.json
@@ -83,7 +85,7 @@ curl http://127.0.0.1:9222/json/version
 ### 第 3 步：WSL 侧运行脚本
 
 ```bash
-cd ~/douyin-link-to-obsidian
+cd ~/feed-to-notes
 node index.js "https://v.douyin.com/2vX7spOC_sg/"
 ```
 
@@ -520,7 +522,7 @@ D:\ObsidianVault\DouyinTracker\
 **不开 Edge 也能测试脚本基本结构**（不抓数据，但能看配置是否加载正确）：
 
 ```bash
-cd ~/douyin-link-to-obsidian
+cd ~/feed-to-notes
 node -e "const c = require('./config.json'); console.log(JSON.stringify(c, null, 2))"
 ```
 

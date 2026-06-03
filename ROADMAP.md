@@ -1,7 +1,7 @@
-项目：douyin-link-to-obsidian 阶段计划
+项目：feed-to-notes（前身 douyin-link-to-obsidian）阶段计划
 
 当前版本：
-v0.1-douyin-link-to-obsidian
+v0.11-feed-to-notes
 
 总原则：
 1. 当前继续使用 default profile。

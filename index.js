@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * douyin-link-to-obsidian
+ * feed-to-notes (formerly douyin-link-to-obsidian)
  * 输入：一条抖音分享链接
  * 输出：<obsidian.output_dir>/YYYY-MM-DD-博主名-标题.md
  *
@@ -1049,7 +1049,7 @@ async function processOneUrl(url, browser, sharedContext, options = {}) {
 // ============================================================
 async function runSingle(url) {
   console.log('========================================');
-  log('INFO', 'douyin-link-to-obsidian (单条模式)');
+  log('INFO', 'feed-to-notes (单条模式)');
   log('INFO', `配置: output=${OUTPUT_DIR}, cdp=${CDP_URL}, comments=${FETCH_COMMENTS ? `${COMMENT_MAX_COUNT}条` : 'off'}`);
   console.log('========================================');
 
@@ -1067,7 +1067,7 @@ async function runSingle(url) {
 
 async function runBatch(urlsFile) {
   console.log('========================================');
-  log('INFO', 'douyin-link-to-obsidian (批量模式)');
+  log('INFO', 'feed-to-notes (批量模式)');
   log('INFO', `urls 文件: ${urlsFile}`);
   log('INFO', `配置: output=${OUTPUT_DIR}, cdp=${CDP_URL}, comments=${FETCH_COMMENTS ? `${COMMENT_MAX_COUNT}条` : 'off'}`);
   console.log('========================================');
