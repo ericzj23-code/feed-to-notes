@@ -518,6 +518,7 @@ D:\ObsidianVault\DouyinTracker\
 6. **9222 端口不能和正常 Edge 共享**：必须用独立 `--user-data-dir`，否则 `Start-Process` 会拉不起新进程（端口被占用）。
 7. ~~**`/shipin/` 类型 URL 的发布时间抓不到**~~ **v0.2 已修复**：`/video/` 用 `data-e2e="detail-video-publish-time"`，`/shipin/` 兜底用全文正则 `发布时间[：:]\s*\d{4}-\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}`。两种 URL 形式现在都能抓到发布时间。
 8. **重试策略范围有限**：v0.2 失败重试只对**网络/CDP/导航类错误**生效，selector 失败不重试（重试 selector 失败没有意义）。如果遇到 selector 失效，是代码 bug，需要修 selector 而不是重试。
+9. **相对时间显示未解析**：抖音 PC 版对部分视频显示"X 天前""昨天""X 小时前"等相对时间（不是绝对日期），此时 `published_at` 为 null、文件名 fallback 到抓取日，Dataview 按 `published_at` 排序时这条会排到抓取当天（不是真实发布日期）。当前不在自动解析范围内。
 
 ## 调试技巧
 

@@ -469,11 +469,16 @@ async function scrapeDouyinPage(page, url) {
 function yamlEscape(str) {
   // YAML 字符串安全化：含特殊字符（: # & * ? | > ! % @ ` [ ] { } , 等）时用双引号包裹
   // 内部双引号转义
+  // v0.11 改：去掉 .slice(0, 200) 截断
+  // 旧:有 200 字符上限,frontmatter title 会丢尾（title 含长 #tag 串时常见）
+  // 新:不做截断。截断是文件名的责任（sanitizeFilename 已做 80 字符）,
+  //    frontmatter 字段值应该保留全文
+  // 安全性:.replace(/"/g, '\\"') 仍在,转义对全长字符串生效（先转义再考虑截断的旧顺序已无关）
   if (str === null || str === undefined) return '""';
   const s = String(str);
   // 纯安全（只含字母数字中文空白 - _）可不引号
   if (/^[\w\u4e00-\u9fa5\-_.\s]+$/.test(s)) return s;
-  return `"${s.replace(/"/g, '\\"').replace(/\n/g, ' ').slice(0, 200)}"`;
+  return `"${s.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`;
 }
 
 function buildMarkdown(data) {
@@ -611,6 +616,14 @@ function buildMarkdown(data) {
 // ============================================================
 // 股票词典（v0.3 轻量版，纯正则+静态词典，不用 LLM）
 // ============================================================
+// 准入规约（v0.11 立）：
+//   1. 禁止 name A 是 name B 的真子串（防 includes 双命中）
+//   2. 禁止过短/过通用的词（'深' / '科技' 单独入会误匹大量财经句子）
+//   3. 加载期自检：违反上面任一条 → console.warn 不阻断（已入库历史笔记不挂）
+//   4. 真要短名，挪到 LLM 精筛（v0.11 长期路线）
+// 词典内子串对 = 0（v0.11 实测）→ includes 当前零误匹
+// 语境误召回（'加深科技投入' 被匹'深科技'）= includes 固有能力边界，
+//   短期不修，长期交给 LLM 精筛兜
 const KNOWN_A_STOCKS = [
   // 评论区/章节里出现过的标的
   '长电科技', '深科技', '太极实业', '晶方科技', '利通电子', '盛合晶微',
@@ -619,6 +632,40 @@ const KNOWN_A_STOCKS = [
   '华为', '意华股份', '瑞芯微', '超讯通信', '昇腾', '玄戒', '玻基',
   // A 股 6 位代码前缀是 60/30/00/68/20 等，识别不靠名字靠数字
 ];
+
+// 加载期自检：词典内子串关系 / 通用短名
+(function validateStockDict() {
+  const MIN_LEN = 2;  // 单字不入词典
+  // 通用词:高频出现在非股票语境,单列入词典会误匹大量财经句子
+  // 注意:'华为' 虽然通用,但当前词典把它当股票名(昇腾/鸿蒙概念),从通用词挪走
+  const GENERAL_TERMS = ['深', '科技', '芯片', '国产'];
+  const issues = [];
+
+  for (let i = 0; i < KNOWN_A_STOCKS.length; i++) {
+    const a = KNOWN_A_STOCKS[i];
+    if (a.length < MIN_LEN) {
+      issues.push(`'${a}' 长度 < ${MIN_LEN}（单字易误匹）`);
+    }
+    if (GENERAL_TERMS.includes(a)) {
+      issues.push(`'${a}' 是通用词（高频出现在非股票语境）`);
+    }
+    for (let j = 0; j < KNOWN_A_STOCKS.length; j++) {
+      if (i === j) continue;
+      const b = KNOWN_A_STOCKS[j];
+      if (a.length < b.length && b.includes(a)) {
+        issues.push(`'${a}' 是 '${b}' 的真子串（includes 会双命中）`);
+      }
+    }
+  }
+
+  // dedup issues
+  const uniq = [...new Set(issues)];
+  if (uniq.length > 0) {
+    console.warn(`[WARN] KNOWN_A_STOCKS 词典准入规约违例 ${uniq.length} 条：`);
+    for (const msg of uniq) console.warn(`  - ${msg}`);
+    console.warn(`  → 建议:改长名/换写法/挪到 LLM 精筛层。脚本不阻断,继续运行`);
+  }
+})();
 
 function extractMentionedSymbols(data) {
   const symbols = [];
@@ -633,6 +680,12 @@ function extractMentionedSymbols(data) {
   ].join('\n');
 
   // 1) 静态词典匹配（中文股票名）
+  // v0.11 拆分策略：
+  //   - 中文名 → includes（不加词边界）
+  //     理由:词典内子串对 = 0（加载期自检验过），includes 当前零误匹
+  //     中文连写,加边界("前后不是汉字")会结构性误杀邻接（实测 README 8 示例只匹 5 个）
+  //   - 语境误召回("加深科技投入"被匹"深科技")= includes 固有能力边界
+  //     短期不修,长期挪 LLM 精筛兜（参见 KNOWN_A_STOCKS 上方准入规约注释）
   for (const name of KNOWN_A_STOCKS) {
     if (blob.includes(name) && !seen.has(`name:${name}`)) {
       symbols.push({ kind: 'a_stock_name', value: name });
@@ -641,7 +694,11 @@ function extractMentionedSymbols(data) {
   }
 
   // 2) A 股 6 位代码（必须以 0/3/6 开头避免误匹）
-  const aCodes = blob.match(/\b[036]\d{5}\b/g) || [];
+  // v0.11 改：\b 在中文文本里不可靠（汉字和数字之间不一定触发 \b）
+  // 用 lookbehind/lookahead 显式排除数字邻接,边界更稳
+  // 注:此处只防"数字-数字"邻接,不防"汉字-数字"邻接（"涨了300000元" 仍是已知误匹能力边界,
+  //   该 case 需要更复杂方案/上下文判断,纳入 LLM 精筛范围）
+  const aCodes = blob.match(/(?<![0-9])[036]\d{5}(?![0-9])/g) || [];
   for (const code of aCodes) {
     if (!seen.has(`code:${code}`)) {
       symbols.push({ kind: 'a_stock_code', value: code });
@@ -650,7 +707,8 @@ function extractMentionedSymbols(data) {
   }
 
   // 3) 港股代码：4-5 位数字 + .HK
-  const hkCodes = blob.match(/\b\d{4,5}\.HK\b/gi) || [];
+  // v0.11 改：同上,lookaround 替代 \b 保持一致
+  const hkCodes = blob.match(/(?<![0-9])\d{4,5}\.HK(?![0-9])/gi) || [];
   for (const code of hkCodes) {
     if (!seen.has(`hk:${code}`)) {
       symbols.push({ kind: 'hk_stock_code', value: code.toUpperCase() });
