@@ -1034,7 +1034,6 @@ async function processOneUrl(url, browser, sharedContext, dedupIndex, options = 
   try {
     // 每条 URL 用独立 page（共享 context 减少资源）
     page = await sharedContext.newPage();
-    const context = page;  // 兼容旧代码
 
     // 抓取（带重试）
     const RETRY_DELAY_MS = 1000;
@@ -1162,9 +1161,10 @@ async function runSingle(url) {
   console.log('========================================');
 
   let browser;
+  let context;  // v0.11 改：声明提到 try 外面,finally 才能 close
   try {
     browser = await connectBrowser();
-    const context = await browser.newContext();
+    context = await browser.newContext();
     // v0.11 改：单条也走 dedup 索引（保持签名一致;空库起步,本条命中就 skip）
     const dedupIndex = scanAlreadyScraped();
     const result = await processOneUrl(url, browser, context, dedupIndex, { isBatch: false });
@@ -1175,6 +1175,13 @@ async function runSingle(url) {
     // 此时 processOneUrl 的局部 failureLog 还没建（如 connectBrowser 阶段就挂）
     // 进程级失败读全局 FAILURE_LOG 是合理兜底
     return { url, status: 'failed', reason: e.message, failure_log: [...FAILURE_LOG] };
+  } finally {
+    // v0.11 改：显式 close context
+    // 旧: 新建了 context 但从不 close, 进程退出才释放, 日后若 runSingle 被长驻进程调用会漏
+    // 新: try/finally 闭环, 风格与 runBatch / runCreatorsBatch 一致
+    if (context) {
+      try { await context.close(); } catch {}
+    }
   }
 }
 
@@ -1507,8 +1514,12 @@ function buildCreatorReport(secUid, data, statePath) {
 }
 
 // 跑单博主：抓 + diff + 写 state + 写 report
+// v0.11 改：接 sharedContext 参数
+//   - 传 sharedContext → 用之（批量博主场景, runCreatorsBatch 外层连一次后传入）
+//   - 不传 → 自己 connectBrowser（单博主 --creator 模式, 保持向后兼容）
+// 这样 runBatch 视频批量（连一次复用）/ runCreatorsBatch 博主批量（连一次复用）策略一致
 async function runCreator(url, options = {}) {
-  const { isBatch = false } = options;
+  const { isBatch = false, sharedContext = null } = options;
   const startedAt = Date.now();
   const secUid = extractSecUid(url);
   if (!secUid) {
@@ -1518,20 +1529,27 @@ async function runCreator(url, options = {}) {
   const result = { url, sec_uid: secUid, status: 'failed', file: null, reason: null, elapsed_ms: 0 };
 
   log('INFO', `开始追踪博主: sec_uid=${secUid}`);
-  let browser;
-  let sharedContext;
-  try {
-    browser = await connectBrowser();
-    sharedContext = browser.contexts()[0] || await browser.newContext();
-  } catch (e) {
-    result.reason = `CDP 连接失败: ${e.message}`;
-    result.elapsed_ms = Date.now() - startedAt;
-    return result;
+
+  // sharedContext 决策: 批量场景外层传, 单博主场景自连
+  // ownContext 仅当自连时持有, 异常路径要关（ownBrowser 引用保留作 CDP 来源, 不主动 close:
+  //   connectOverCDP 复用本机 Edge 进程, 关了用户得重启）
+  let ownContext = null;
+  let context = sharedContext;
+  if (!context) {
+    try {
+      const ownBrowser = await connectBrowser();
+      ownContext = ownBrowser.contexts()[0] || await ownBrowser.newContext();
+      context = ownContext;
+    } catch (e) {
+      result.reason = `CDP 连接失败: ${e.message}`;
+      result.elapsed_ms = Date.now() - startedAt;
+      return result;
+    }
   }
 
   let page;
   try {
-    page = await sharedContext.newPage();
+    page = await context.newPage();
     const data = await scrapeCreatorPage(page, secUid);
     await page.close();
 
@@ -1580,12 +1598,20 @@ async function runCreator(url, options = {}) {
     if (page) try { await page.close(); } catch {}
     // 博主追踪是进程级 fatal log,不传 target → 走全局 FAILURE_LOG（fail 默认行为）
     fail('博主追踪异常', e.message);
+  } finally {
+    // 自连模式: 关闭 ownContext（外层传的 sharedContext 不归本函数管, 那是 runCreatorsBatch 的事）
+    if (ownContext) {
+      try { await ownContext.close(); } catch {}
+    }
   }
   result.elapsed_ms = Date.now() - startedAt;
   return result;
 }
 
 // 批量博主：复用 runCreator
+// v0.11 改：外层连一次 CDP, 循环里所有 runCreator 复用同一 context
+// 旧: 每个博主都重连 CDP、各开各的 browser 引用, 与 runBatch 视频批量策略不一致
+// 新: 与 runBatch 视频批量对齐, 连一次循环复用, finally 关闭
 async function runCreatorsBatch(filepath) {
   if (!fs.existsSync(filepath)) {
     console.error(`[ERROR] 博主文件不存在: ${filepath}`);
@@ -1600,17 +1626,33 @@ async function runCreatorsBatch(filepath) {
     return null;
   }
   log('INFO', `批量博主模式: ${urls.length} 个博主`);
+
+  let browser;  // browser 不主动 close（CDP 复用本机 Edge 进程, 关了用户得重启）
+  let sharedContext;
   const items = [];
-  for (const url of urls) {
-    if (!isValidCreatorUrl(url)) {
-      log('WARN', `跳过无效博主 URL: ${url}`);
-      items.push({ url, status: 'failed', reason: '不是有效博主 URL（必须含 douyin.com/user/<sec_uid>）' });
-      continue;
+  try {
+    browser = await connectBrowser();
+    sharedContext = browser.contexts()[0] || await browser.newContext();
+
+    for (const url of urls) {
+      if (!isValidCreatorUrl(url)) {
+        log('WARN', `跳过无效博主 URL: ${url}`);
+        items.push({ url, status: 'failed', reason: '不是有效博主 URL（必须含 douyin.com/user/<sec_uid>）' });
+        continue;
+      }
+      // 传 sharedContext → runCreator 不会自连, 复用本批次的 context
+      const r = await runCreator(url, { isBatch: true, sharedContext });
+      items.push(r);
+      log('INFO', `--- ${r.status} | ${r.url} ---`);
     }
-    const r = await runCreator(url, { isBatch: true });
-    items.push(r);
-    log('INFO', `--- ${r.status} | ${r.url} ---`);
+  } catch (e) {
+    log('ERROR', `批量博主主流程异常: ${e.message}`);
+  } finally {
+    if (sharedContext) {
+      try { await sharedContext.close(); } catch {}
+    }
   }
+
   const summary = {
     total: urls.length,
     success: items.filter(i => i.status === 'success').length,
