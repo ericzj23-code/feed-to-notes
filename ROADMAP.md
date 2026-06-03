@@ -295,3 +295,14 @@ v0.9 新增 `creator_tracking` 配置块（缺省即用默认，不破坏现有 
 **影响**：评论抓取在超长评论区可能变慢（数量级 100+ 候选时进入明显 O(n²)）。**当前未实测触发**。
 
 **候选修法**：用 children hash（`c.children.length` + `c.firstChild?.textContent` 之类指纹）做 Map 预 dedup，避免两两 contains。
+
+### 候选 4：test-report 文件归档
+
+**现状**（陈述）：仓库根目录已堆 4 份 test-report 类文件（`test-report.md` / `test-report-v071.md` / `test-report-v09.md` + ROADMAP 内"阶段六实施记录"段）。历史快照性质，**不会腐烂**，但散在根目录影响整洁度。
+
+**影响**：不影响功能，纯整洁问题。
+
+**候选修法**：
+- 把历史报告挪进 `docs/reports/`（新建子目录），根目录只留最新一份 + 指向入口
+- 或挂到对应 git tag 的 release notes（每个 v0.x tag 带一个 release note 段）
+- Eric 原话"不急，但迟早要理"
