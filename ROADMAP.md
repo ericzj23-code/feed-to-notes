@@ -229,3 +229,69 @@ v0.9 新增 `creator_tracking` 配置块（缺省即用默认，不破坏现有 
 ### 详细测试数据
 
 见 `test-report-v09.md`（5 步走 + 5 步算法正确性硬证据）。
+
+---
+
+## v0.11 实施记录
+
+> **状态**：✅ 已完成（2026-06-03）
+> **commits**（4 个，bisect 友好）：
+> - `aa51169` v0.11 dedup: scan 外提 + video_id 锚点
+> - `ceca526` v0.11 symbol 提取: 数字 lookaround + 中文 includes + 词典准入自检
+> - `bc2a3a5` v0.11 FAILURE_LOG 局部化: fail() 接 target, processOneUrl 用局部数组
+> - `ae90923` v0.11 lifecycle consistency
+
+### 已落地的关键决策（陈述现状）
+
+| 决策点 | 当前状态 | 已知能力边界 |
+|--------|----------|--------------|
+| dedup 锚点 | 双 Map：URL 字符串 + video_id。A 路径：URL 命中走快 skip；B 路径：scrape 后 video_id 命中走 skip（白跑一次 scrape，elapsed_ms 照实记录不归零） | B 路径代价是单条 URL 多走一次 scrape |
+| symbol 中文名 | `blob.includes(name)`，不加词边界 | "加深科技投入"会匹出"深科技"——语境误召回，已知能力边界，留待 LLM 精筛 |
+| symbol 数字代码 | `(?<![0-9])[036]\d{5}(?![0-9])` + 港股同款 | "涨了300000元"仍误匹——汉字-数字邻接不是数字-数字邻接，lookaround 修不了，留待 LLM 精筛 |
+| 词典准入规约 | 加载期 `validateStockDict()` 自检：单字 / 通用词 / 真子串对 → console.warn 不阻断 | warn 不阻断是为了不挂历史已入库笔记 |
+| FAILURE_LOG | `fail(reason, detail, target)`，局部数组天然隔离并发 | 全局 `FAILURE_LOG` 保留作进程级 fatal log（博主追踪 / CDP 连接） |
+| 生命周期 | runSingle / runBatch / runCreatorsBatch 全部 try/finally 闭环；runCreatorsBatch 外层连一次 CDP，循环复用 sharedContext | `connectOverCDP` 复用本机 Edge 进程不主动 close（关了下次跑要重启 Edge） |
+| yamlEscape | 不截断 frontmatter 字段值 | 文件名截断归 `sanitizeFilename`（80 字符） |
+| 相对时间 | **未解析**——抖音 PC 显示"X 天前""昨天"时 `published_at=null`，文件名 fallback 到抓取日 | Dataview 按 `published_at` 排序时这条会错位，详见下方 v0.12 候选 |
+
+### 回归验证（v0.11 → 真实库 71 条笔记回放）
+
+- **symbol**：旧匹 98 中文名 / 1 代码 → 新匹 98 / 1，0 差异。README 示例 8 个 symbol 全召回。词典内子串对 = 0（实测）。
+- **dedup B 路径**：5 个场景离线模拟 16/16 通过，覆盖"短链→长链重抓（A）""/shipin/ 形式重抓（B）""长链已抓→短链重抓（B）"。
+
+### 代码内规约注释
+
+`index.js` 的 `KNOWN_A_STOCKS` 上方写有完整准入规约（禁收长名子串碎词 / 禁收单字 / 禁收通用词），扩词典时遵守。
+
+---
+
+## v0.12 候选
+
+> **状态**：未开始。本节只是把"已知未修"列出来陈述现状，不承诺时间表。
+
+### 候选 1：相对时间解析
+
+**现状**（陈述）：抖音 PC 版对部分视频显示"X 天前""昨天""X 小时前""X 分钟前"等相对时间，scrape 时 `published_at` 为 null，文件名 fallback 到抓取日。Dataview 按 `published_at` 排序时这些笔记会排到抓取当天（不是真实发布日期）。README 已知坑 #9 已有说明。
+
+**影响**：单条笔记层面的"不报错但慢慢歪"——按日期排序时错位，**不会**让笔记丢失或损坏。
+
+**候选修法**（不承诺哪版做）：
+- 在 `scrapeDouyinPage` 的 `meta.publishTime` 提取后加 fallback 链：`/data-e2e` → 全文正则（`\d{4}-\d{1,2}-\d{1,2}`）→ 相对时间解析（"X 分钟前" → `new Date() - X*60*1000`；"X 小时前" 同理；"昨天 HH:MM" → `new Date() - 86400000`；"X 天前" → `new Date() - X*86400000`）
+- 单元测试 5+ 个 case（覆盖"3 分钟前""昨天 09:30""5 天前" 等）
+- 写明**相对时间只是估计**，不是发布真实秒级时间——写入 `published_at` 时可加注释或用单独字段
+
+### 候选 2：批量博主跨次跑去重（v0.9 已知限制 #1）
+
+**现状**（陈述）：博主主页"作品"分页动态性，同一博主 8 分钟内两次跑"新视频"数会变。v0.9 README 已知限制 #1 已说明。
+
+**影响**：delta 报告里多报 / 少报新视频，**不会**让已抓笔记丢失或损坏。
+
+**候选修法**：跨次 run 缓存 `aweme_id` 历史快照到 `state` 文件，diff 时和快照对比而不是和"本次抓到"对比。
+
+### 候选 3：评论 O(n²) candidates.contains
+
+**现状**（陈述）：v0.7.1 评论抓取那段 `candidates.sort` 后做 O(n²) 的 `contains` 两两比较。财经评论页 candidates 通常 10-50 条，长评论区会是热点。
+
+**影响**：评论抓取在超长评论区可能变慢（数量级 100+ 候选时进入明显 O(n²)）。**当前未实测触发**。
+
+**候选修法**：用 children hash（`c.children.length` + `c.firstChild?.textContent` 之类指纹）做 Map 预 dedup，避免两两 contains。
