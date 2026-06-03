@@ -69,9 +69,23 @@ const LOG_PREFIX = {
 };
 const log = (level, msg) => console.log(`${LOG_PREFIX[level] || '[LOG]'} ${msg}`);
 
-const FAILURE_LOG = [];
-const fail = (reason, detail = '') => {
-  FAILURE_LOG.push({ reason, detail, at: new Date().toISOString() });
+// ============================================================
+// 失败日志（v0.11 拆分策略）
+// ============================================================
+// 全局 FAILURE_LOG：进程级 fatal log 容器
+//   - 博主追踪（runCreator / runCreatorsBatch）: 进程级失败, 用全局
+//   - CDP 连接 / Playwright connectOverCDP: 进程级失败, 用全局
+//   - main 主流程: 同上
+// 局部 failureLog（processOneUrl 内部建）: 单条 URL 的失败原因
+//   - scrapeDouyinPage 子函数: 借用父级传下来的 target 数组
+//   - processOneUrl 成功/失败都把这份局部数组写进 result.failure_log
+// 旧实现: 单条 URL 用全局 FAILURE_LOG, 开头手动 length=0 清空
+//   → 全局变量传函数内状态, 单进程串行没事, 并发立刻串味
+//   → "半通不通": 拆了 dedup 全局依赖又留着另一个全局依赖
+// 新实现: fail(reason, detail, target) target 显式, 局部数组天然隔离
+const FAILURE_LOG = [];  // 进程级 fatal log（保留, 不删）
+const fail = (reason, detail = '', target = FAILURE_LOG) => {
+  target.push({ reason, detail, at: new Date().toISOString() });
   log('ERROR', `${reason}${detail ? ' | ' + detail : ''}`);
 };
 
@@ -182,14 +196,15 @@ async function waitForChapterStability(page) {
 
 // ============================================================
 // 抓取核心（用实战验证的 DOM selector）
+// v0.11 改：接 failureLog 参数，fail() 调用显式传入，不再借用全局
 // ============================================================
-async function scrapeDouyinPage(page, url) {
+async function scrapeDouyinPage(page, url, failureLog) {
   log('INFO', `导航: ${url}`);
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: GOTO_TIMEOUT_MS });
   } catch (e) {
     // 网络/timeout 类错误 → 抛给上层 retry 包装
-    fail('页面导航失败', e.message);
+    fail('页面导航失败', e.message, failureLog);
     throw e;
   }
   await page.waitForTimeout(WAIT_AFTER_NAV_MS);
@@ -281,13 +296,13 @@ async function scrapeDouyinPage(page, url) {
     return out;
   });
 
-  if (!meta.title) fail('标题未抓到', 'detail-video-info 容器为空或无 h1');
+  if (!meta.title) fail('标题未抓到', 'detail-video-info 容器为空或无 h1', failureLog);
   if (!meta.author) {
-    fail('作者未抓到', '作者卡片 selector 失效或视频无作者信息');
+    fail('作者未抓到', '作者卡片 selector 失效或视频无作者信息', failureLog);
     log('WARN', '作者未抓到（不影响继续）');
   }
   if (!meta.publishTime) {
-    fail('发布时间未抓到', 'detail-video-publish-time 元素不存在');
+    fail('发布时间未抓到', 'detail-video-publish-time 元素不存在', failureLog);
     log('WARN', '发布时间未抓到');
   }
 
@@ -377,7 +392,7 @@ async function scrapeDouyinPage(page, url) {
     }, COMMENT_MAX_COUNT);
     log('INFO', `评论: ${comments.length} 条`);
     if (comments.length === 0) {
-      fail('评论未抓到', '未找到匹配"回复+分享+数字赞数"的评论条目 DOM（可能未登录或视频无评论）');
+      fail('评论未抓到', '未找到匹配"回复+分享+数字赞数"的评论条目 DOM（可能未登录或视频无评论）', failureLog);
       log('WARN', '评论未抓到（可能未登录或视频无评论）');
     }
   } else {
@@ -437,7 +452,7 @@ async function scrapeDouyinPage(page, url) {
       return { ok: true, text: lines.join('\n'), count: lines.length };
     });
   } catch (e) {
-    fail('字幕抓取异常', e.message);
+    fail('字幕抓取异常', e.message, failureLog);
     subtitle = { ok: false, reason: 'exception: ' + e.message };
   }
 
@@ -722,7 +737,9 @@ function extractMentionedSymbols(data) {
 // ============================================================
 // JSON 输出
 // ============================================================
-function buildJson(data) {
+function buildJson(data, failureLog = []) {
+  // v0.11 改：failureLog 由调用方（processOneUrl 内部）传入, 不再读全局
+  // 旧: failure_log: [...FAILURE_LOG]  (读全局, 单进程串行 ok, 并发串味)
   // content_text：用 chapters + 关键评论拼一段纯文本描述（v0.3 没有正文文案）
   const contentParts = [];
   if (data.chapters.length) {
@@ -759,7 +776,7 @@ function buildJson(data) {
       stats: data.stats || null,
       // raw_payload 不含 cookie（本来就没读）也不含 mp4 URL
     },
-    failure_log: [...FAILURE_LOG],  // 拷贝一份，避免后续操作影响原数组
+    failure_log: [...failureLog],  // 拷贝一份，避免后续操作影响原数组
     // v0.7.1 P3: summary 字段在 enabled=false 或 LLM 失败时为 null，整字段不写
     // （v0.6 行为：始终写 null；v0.7.1 行为：仅在有值时写）
   };
@@ -1009,8 +1026,9 @@ async function processOneUrl(url, browser, sharedContext, dedupIndex, options = 
     return result;
   }
 
-  // 清空 FAILURE_LOG（避免跨 URL 串）
-  FAILURE_LOG.length = 0;
+  // v0.11 改：局部 failureLog,不再用全局 FAILURE_LOG
+  // 局部数组天然隔离,并发场景下不会串味（旧实现开头 length=0 清全局是脆 hack）
+  const failureLog = [];
 
   let page;
   try {
@@ -1027,7 +1045,7 @@ async function processOneUrl(url, browser, sharedContext, dedupIndex, options = 
     while (attempts < maxAttempts) {
       attempts++;
       try {
-        data = await scrapeDouyinPage(page, url);
+        data = await scrapeDouyinPage(page, url, failureLog);
         if (attempts > 1) log('INFO', `第 ${attempts} 次重试成功`);
         break;
       } catch (e) {
@@ -1045,7 +1063,7 @@ async function processOneUrl(url, browser, sharedContext, dedupIndex, options = 
     // 验收检查
     const hit = [data.title, data.author, data.publishTime].filter(Boolean).length;
     if (hit === 0) {
-      fail('关键字段全空', '标题/作者/发布时间 都未抓到，可能被反爬或登录态失效');
+      fail('关键字段全空', '标题/作者/发布时间 都未抓到，可能被反爬或登录态失效', failureLog);
       log('WARN', '继续生成文件（标注"未知"）以便人工补全');
     }
 
@@ -1077,7 +1095,7 @@ async function processOneUrl(url, browser, sharedContext, dedupIndex, options = 
     log('SUCCESS', `已保存: ${filepath}`);
 
     const jsonFilepath = filepath.replace(/\.md$/, '.json');
-    fs.writeFileSync(jsonFilepath, buildJson(data), 'utf8');
+    fs.writeFileSync(jsonFilepath, buildJson(data, failureLog), 'utf8');
     log('SUCCESS', `已保存: ${jsonFilepath}`);
 
     // 增量更新 dedup 索引（防止同一 urls.txt 内后续行重复 scrape）
@@ -1089,7 +1107,7 @@ async function processOneUrl(url, browser, sharedContext, dedupIndex, options = 
       await enrichWithSummary(data);
       if (data.summary) {
         fs.writeFileSync(filepath, buildMarkdown(data), 'utf8');
-        fs.writeFileSync(jsonFilepath, buildJson(data), 'utf8');
+        fs.writeFileSync(jsonFilepath, buildJson(data, failureLog), 'utf8');
         log('SUCCESS', `已附加 AI 总结到: ${filepath}`);
       }
     } catch (e) {
@@ -1099,7 +1117,7 @@ async function processOneUrl(url, browser, sharedContext, dedupIndex, options = 
     result.status = 'success';
     result.file = filepath;
     result.json_file = jsonFilepath;
-    result.failure_log = [...FAILURE_LOG];
+    result.failure_log = [...failureLog];
 
     // 摘要（单条模式才打印，批量模式每条都打太长）
     if (!isBatch) {
@@ -1119,8 +1137,10 @@ async function processOneUrl(url, browser, sharedContext, dedupIndex, options = 
   } catch (e) {
     result.status = 'failed';
     result.reason = e.message;
-    result.failure_log = [...FAILURE_LOG];
-    fail('抓取异常', e.message);
+    // 抓取异常时,本 URL 已收集的失败原因（局部 failureLog）一并记录
+    // 此时 failureLog 已经被前面 fail() 调用填好,直接读
+    result.failure_log = [...failureLog];
+    fail('抓取异常', e.message, failureLog);
     if (!isBatch) console.error(e.stack);
   } finally {
     if (page) {
@@ -1151,6 +1171,9 @@ async function runSingle(url) {
     return result;
   } catch (e) {
     log('ERROR', `主流程异常: ${e.message}`);
+    // runSingle 级别 catch: 抓 connectBrowser / processOneUrl 之外的错误
+    // 此时 processOneUrl 的局部 failureLog 还没建（如 connectBrowser 阶段就挂）
+    // 进程级失败读全局 FAILURE_LOG 是合理兜底
     return { url, status: 'failed', reason: e.message, failure_log: [...FAILURE_LOG] };
   }
 }
@@ -1555,6 +1578,7 @@ async function runCreator(url, options = {}) {
   } catch (e) {
     result.reason = e.message;
     if (page) try { await page.close(); } catch {}
+    // 博主追踪是进程级 fatal log,不传 target → 走全局 FAILURE_LOG（fail 默认行为）
     fail('博主追踪异常', e.message);
   }
   result.elapsed_ms = Date.now() - startedAt;
