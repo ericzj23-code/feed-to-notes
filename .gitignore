@@ -2,3 +2,7 @@ node_modules/
 package-lock.json
 *.bak
 test-output/
+
+# v0.7 起: 真实抖音 URL fixture 不入库 (含 30 条作者抓过的真实链接)
+# 历史 commit 180adc8 里有, 已用 git rm --cached 摘出, 此后忽略
+tests/fixtures/urls-*.txt
